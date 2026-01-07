@@ -12,6 +12,7 @@ type
     FMemory: TMemory;
     FCycles: Integer;
     FIME: Boolean;
+    FEnableIMEPending: Boolean;
     FHalted: Boolean;
     FStopped: Boolean;
     function GetAF: TWord;
@@ -88,6 +89,7 @@ begin
   FRegisters.F := 0;
   FCycles := 0;
   FIME := False;
+  FEnableIMEPending := False;
   FHalted := False;
   FStopped := False;
 end;
@@ -483,6 +485,9 @@ var
   Signed8: ShortInt;
   BitIndex: Integer;
   RegIndex: Integer;
+  EnableIMEAfter: Boolean;
+begin
+  EnableIMEAfter := FEnableIMEPending;
 begin
   if FHalted or FStopped then
   begin
@@ -1134,6 +1139,10 @@ begin
         else
           Result := 12;
       end;
+    $D3:
+      begin
+        Result := 4;
+      end;
     $D4:
       begin
         Temp16 := FetchWord;
@@ -1189,6 +1198,10 @@ begin
         else
           Result := 12;
       end;
+    $DB:
+      begin
+        Result := 4;
+      end;
     $DC:
       begin
         Temp16 := FetchWord;
@@ -1200,6 +1213,10 @@ begin
         end
         else
           Result := 12;
+      end;
+    $DD:
+      begin
+        Result := 4;
       end;
     $DE:
       begin
@@ -1226,6 +1243,14 @@ begin
       begin
         WriteByte($FF00 + FRegisters.C, FRegisters.A);
         Result := 8;
+      end;
+    $E3:
+      begin
+        Result := 4;
+      end;
+    $E4:
+      begin
+        Result := 4;
       end;
     $E5:
       begin
@@ -1259,6 +1284,18 @@ begin
         WriteByte(FetchWord, FRegisters.A);
         Result := 16;
       end;
+    $EB:
+      begin
+        Result := 4;
+      end;
+    $EC:
+      begin
+        Result := 4;
+      end;
+    $ED:
+      begin
+        Result := 4;
+      end;
     $EE:
       begin
         Xor8(FetchByte);
@@ -1288,6 +1325,11 @@ begin
     $F3:
       begin
         FIME := False;
+        FEnableIMEPending := False;
+        Result := 4;
+      end;
+    $F4:
+      begin
         Result := 4;
       end;
     $F5:
@@ -1324,6 +1366,15 @@ begin
       end;
     $FB:
       begin
+        FEnableIMEPending := True;
+        Result := 4;
+      end;
+    $FC:
+      begin
+        Result := 4;
+      end;
+    $FD:
+      begin
         FIME := True;
         Result := 4;
       end;
@@ -1343,6 +1394,10 @@ begin
   end;
 
   Inc(FCycles, Result);
+  if EnableIMEAfter then
+  begin
+    FIME := True;
+    FEnableIMEPending := False;
 begin
   OpCode := FMemory.ReadByte(FRegisters.PC);
   Inc(FRegisters.PC);
