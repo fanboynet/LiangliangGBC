@@ -4,6 +4,7 @@ interface
 
 uses
   Common, PPU;
+  Common;
 
 type
   TMemory = class
@@ -12,6 +13,7 @@ type
     FPPU: TPPU;
   public
     procedure AttachPPU(APPU: TPPU);
+  public
     procedure Reset;
     function ReadByte(Address: TWord): TByte;
     procedure WriteByte(Address: TWord; Value: TByte);
