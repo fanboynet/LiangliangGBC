@@ -472,6 +472,7 @@ begin
     6: WriteByte(GetHL, Value);
     7: FRegisters.A := Value;
   end;
+  FCycles := 0;
 end;
 
 function TCPU.Step: Integer;
@@ -1342,6 +1343,16 @@ begin
   end;
 
   Inc(FCycles, Result);
+begin
+  OpCode := FMemory.ReadByte(FRegisters.PC);
+  Inc(FRegisters.PC);
+  Inc(FCycles, 4);
+  Result := 4;
+  case OpCode of
+    $00: ;
+  else
+    ;
+  end;
 end;
 
 end.
