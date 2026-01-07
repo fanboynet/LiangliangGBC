@@ -474,6 +474,7 @@ begin
     6: WriteByte(GetHL, Value);
     7: FRegisters.A := Value;
   end;
+  FCycles := 0;
 end;
 
 function TCPU.Step: Integer;
@@ -487,6 +488,7 @@ var
   EnableIMEAfter: Boolean;
 begin
   EnableIMEAfter := FEnableIMEPending;
+begin
   if FHalted or FStopped then
   begin
     Inc(FCycles, 4);
@@ -1373,6 +1375,7 @@ begin
       end;
     $FD:
       begin
+        FIME := True;
         Result := 4;
       end;
     $FE:
@@ -1395,6 +1398,15 @@ begin
   begin
     FIME := True;
     FEnableIMEPending := False;
+begin
+  OpCode := FMemory.ReadByte(FRegisters.PC);
+  Inc(FRegisters.PC);
+  Inc(FCycles, 4);
+  Result := 4;
+  case OpCode of
+    $00: ;
+  else
+    ;
   end;
 end;
 

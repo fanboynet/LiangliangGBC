@@ -37,6 +37,8 @@ begin
   FPPU := TPPU.Create;
   FMemory.AttachPPU(FPPU);
   FCPU := TCPU.Create(FMemory);
+  FCPU := TCPU.Create(FMemory);
+  FPPU := TPPU.Create;
   FAPU := TAPU.Create;
   FCartridge := TCartridge.Create;
   Reset;
@@ -48,6 +50,8 @@ begin
   FAPU.Free;
   FCPU.Free;
   FPPU.Free;
+  FPPU.Free;
+  FCPU.Free;
   FMemory.Free;
   inherited Destroy;
 end;
