@@ -34,6 +34,9 @@ constructor TGBEmulator.Create;
 begin
   inherited Create;
   FMemory := TMemory.Create;
+  FPPU := TPPU.Create;
+  FMemory.AttachPPU(FPPU);
+  FCPU := TCPU.Create(FMemory);
   FCPU := TCPU.Create(FMemory);
   FPPU := TPPU.Create;
   FAPU := TAPU.Create;
@@ -45,6 +48,8 @@ destructor TGBEmulator.Destroy;
 begin
   FCartridge.Free;
   FAPU.Free;
+  FCPU.Free;
+  FPPU.Free;
   FPPU.Free;
   FCPU.Free;
   FMemory.Free;
