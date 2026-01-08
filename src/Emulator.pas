@@ -35,6 +35,11 @@ begin
   inherited Create;
   FMemory := TMemory.Create;
   FPPU := TPPU.Create;
+  FCartridge := TCartridge.Create;
+  FMemory.AttachPPU(FPPU);
+  FMemory.AttachCartridge(FCartridge);
+  FCPU := TCPU.Create(FMemory);
+  FAPU := TAPU.Create;
   FMemory.AttachPPU(FPPU);
   FCPU := TCPU.Create(FMemory);
   FCPU := TCPU.Create(FMemory);

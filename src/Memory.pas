@@ -3,6 +3,7 @@ unit Memory;
 interface
 
 uses
+  Common, PPU, Cartridge;
   Common, PPU;
   Common;
 
@@ -11,6 +12,10 @@ type
   private
     FData: array[0..MemorySize - 1] of TByte;
     FPPU: TPPU;
+    FCartridge: TCartridge;
+  public
+    procedure AttachPPU(APPU: TPPU);
+    procedure AttachCartridge(ACartridge: TCartridge);
   public
     procedure AttachPPU(APPU: TPPU);
   public
@@ -28,6 +33,11 @@ begin
   FPPU := APPU;
 end;
 
+procedure TMemory.AttachCartridge(ACartridge: TCartridge);
+begin
+  FCartridge := ACartridge;
+end;
+
 procedure TMemory.Reset;
 begin
   FillChar(FData, SizeOf(FData), 0);
@@ -35,6 +45,11 @@ end;
 
 function TMemory.ReadByte(Address: TWord): TByte;
 begin
+  if Assigned(FCartridge) then
+  begin
+    if (Address <= $7FFF) or ((Address >= $A000) and (Address <= $BFFF)) then
+      Exit(FCartridge.ReadByte(Address));
+  end;
   if Assigned(FPPU) then
   begin
     if (Address >= $8000) and (Address <= $9FFF) then
@@ -53,6 +68,14 @@ end;
 
 procedure TMemory.WriteByte(Address: TWord; Value: TByte);
 begin
+  if Assigned(FCartridge) then
+  begin
+    if (Address <= $7FFF) or ((Address >= $A000) and (Address <= $BFFF)) then
+    begin
+      FCartridge.WriteByte(Address, Value);
+      Exit;
+    end;
+  end;
   if Assigned(FPPU) then
   begin
     if (Address >= $8000) and (Address <= $9FFF) then
