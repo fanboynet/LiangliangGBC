@@ -9,6 +9,8 @@ uses
   Memory,
   PPU,
   APU,
+  Cartridge,
+  Joypad;
   Cartridge;
 
 type
@@ -19,6 +21,7 @@ type
     FPPU: TPPU;
     FAPU: TAPU;
     FCartridge: TCartridge;
+    FJoypad: TJoypad;
   public
     constructor Create;
     destructor Destroy; override;
@@ -26,6 +29,7 @@ type
     function LoadCartridge(const FileName: string): Boolean;
     procedure Step;
     procedure RunFrame;
+    property Joypad: TJoypad read FJoypad;
   end;
 
 implementation
@@ -36,6 +40,12 @@ begin
   FMemory := TMemory.Create;
   FPPU := TPPU.Create;
   FCartridge := TCartridge.Create;
+  FJoypad := TJoypad.Create;
+  FMemory.AttachPPU(FPPU);
+  FMemory.AttachCartridge(FCartridge);
+  FMemory.AttachJoypad(FJoypad);
+  FCPU := TCPU.Create(FMemory);
+  FAPU := TAPU.Create;
   FMemory.AttachPPU(FPPU);
   FMemory.AttachCartridge(FCartridge);
   FCPU := TCPU.Create(FMemory);
@@ -51,6 +61,7 @@ end;
 
 destructor TGBEmulator.Destroy;
 begin
+  FJoypad.Free;
   FCartridge.Free;
   FAPU.Free;
   FCPU.Free;
@@ -67,6 +78,7 @@ begin
   FCPU.Reset;
   FPPU.Reset;
   FAPU.Reset;
+  FJoypad.Reset;
 end;
 
 function TGBEmulator.LoadCartridge(const FileName: string): Boolean;

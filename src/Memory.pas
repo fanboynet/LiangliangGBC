@@ -3,6 +3,7 @@ unit Memory;
 interface
 
 uses
+  Common, PPU, Cartridge, Joypad;
   Common, PPU, Cartridge;
   Common, PPU;
   Common;
@@ -13,6 +14,11 @@ type
     FData: array[0..MemorySize - 1] of TByte;
     FPPU: TPPU;
     FCartridge: TCartridge;
+    FJoypad: TJoypad;
+  public
+    procedure AttachPPU(APPU: TPPU);
+    procedure AttachCartridge(ACartridge: TCartridge);
+    procedure AttachJoypad(AJoypad: TJoypad);
   public
     procedure AttachPPU(APPU: TPPU);
     procedure AttachCartridge(ACartridge: TCartridge);
@@ -38,6 +44,11 @@ begin
   FCartridge := ACartridge;
 end;
 
+procedure TMemory.AttachJoypad(AJoypad: TJoypad);
+begin
+  FJoypad := AJoypad;
+end;
+
 procedure TMemory.Reset;
 begin
   FillChar(FData, SizeOf(FData), 0);
@@ -50,6 +61,8 @@ begin
     if (Address <= $7FFF) or ((Address >= $A000) and (Address <= $BFFF)) then
       Exit(FCartridge.ReadByte(Address));
   end;
+  if Assigned(FJoypad) and (Address = $FF00) then
+    Exit(FJoypad.ReadRegister);
   if Assigned(FPPU) then
   begin
     if (Address >= $8000) and (Address <= $9FFF) then
@@ -75,6 +88,11 @@ begin
       FCartridge.WriteByte(Address, Value);
       Exit;
     end;
+  end;
+  if Assigned(FJoypad) and (Address = $FF00) then
+  begin
+    FJoypad.WriteRegister(Value);
+    Exit;
   end;
   if Assigned(FPPU) then
   begin
