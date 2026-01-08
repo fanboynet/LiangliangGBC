@@ -32,6 +32,12 @@ type
     function ReadByte(Address: Word): Byte;
     procedure WriteByte(Address: Word; Value: Byte);
     function Title: string;
+  TCartridge = class
+  private
+    FData: TBytes;
+  public
+    function LoadFromFile(const FileName: string): Boolean;
+    function Data: TBytes;
   end;
 
 implementation
@@ -221,6 +227,11 @@ begin
     HandleBanking(Address, Value)
   else if (Address >= $A000) and (Address <= $BFFF) then
     SetRAMByte(Address, Value);
+end;
+
+function TCartridge.Data: TBytes;
+begin
+  Result := FData;
 end;
 
 end.

@@ -11,6 +11,7 @@ uses
   APU,
   Cartridge,
   Joypad;
+  Cartridge;
 
 type
   TGBEmulator = class
@@ -45,6 +46,16 @@ begin
   FMemory.AttachJoypad(FJoypad);
   FCPU := TCPU.Create(FMemory);
   FAPU := TAPU.Create;
+  FMemory.AttachPPU(FPPU);
+  FMemory.AttachCartridge(FCartridge);
+  FCPU := TCPU.Create(FMemory);
+  FAPU := TAPU.Create;
+  FMemory.AttachPPU(FPPU);
+  FCPU := TCPU.Create(FMemory);
+  FCPU := TCPU.Create(FMemory);
+  FPPU := TPPU.Create;
+  FAPU := TAPU.Create;
+  FCartridge := TCartridge.Create;
   Reset;
 end;
 
@@ -55,6 +66,8 @@ begin
   FAPU.Free;
   FCPU.Free;
   FPPU.Free;
+  FPPU.Free;
+  FCPU.Free;
   FMemory.Free;
   inherited Destroy;
 end;
@@ -71,6 +84,8 @@ end;
 function TGBEmulator.LoadCartridge(const FileName: string): Boolean;
 begin
   Result := FCartridge.LoadFromFile(FileName);
+  if Result then
+    FMemory.LoadCartridge(FCartridge.Data);
 end;
 
 procedure TGBEmulator.Step;

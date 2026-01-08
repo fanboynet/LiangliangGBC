@@ -4,6 +4,9 @@ interface
 
 uses
   Common, PPU, Cartridge, Joypad;
+  Common, PPU, Cartridge;
+  Common, PPU;
+  Common;
 
 type
   TMemory = class
@@ -16,6 +19,12 @@ type
     procedure AttachPPU(APPU: TPPU);
     procedure AttachCartridge(ACartridge: TCartridge);
     procedure AttachJoypad(AJoypad: TJoypad);
+  public
+    procedure AttachPPU(APPU: TPPU);
+    procedure AttachCartridge(ACartridge: TCartridge);
+  public
+    procedure AttachPPU(APPU: TPPU);
+  public
     procedure Reset;
     function ReadByte(Address: TWord): TByte;
     procedure WriteByte(Address: TWord; Value: TByte);
