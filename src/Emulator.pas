@@ -30,6 +30,7 @@ type
     procedure Step;
     procedure RunFrame;
     property Joypad: TJoypad read FJoypad;
+    property PPU: TPPU read FPPU;
   end;
 
 implementation
