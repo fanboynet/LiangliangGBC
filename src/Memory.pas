@@ -4,6 +4,8 @@ interface
 
 uses
   Common, PPU, Cartridge;
+  Common, PPU;
+  Common;
 
 type
   TMemory = class
@@ -14,6 +16,9 @@ type
   public
     procedure AttachPPU(APPU: TPPU);
     procedure AttachCartridge(ACartridge: TCartridge);
+  public
+    procedure AttachPPU(APPU: TPPU);
+  public
     procedure Reset;
     function ReadByte(Address: TWord): TByte;
     procedure WriteByte(Address: TWord; Value: TByte);
