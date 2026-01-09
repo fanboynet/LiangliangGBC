@@ -58,6 +58,13 @@ type
     procedure Step(Cycles: Integer);
     function ReadRegister(Address: Word): Byte;
     procedure WriteRegister(Address: Word; Value: Byte);
+  TAPU = class
+  private
+    FCycles: Integer;
+  public
+    procedure Reset;
+    procedure Step(Cycles: Integer);
+    property Cycles: Integer read FCycles;
   end;
 
 implementation
@@ -344,6 +351,14 @@ begin
       FWaveRAM[Address - $FF30] := Value;
   end;
   UpdateChannelEnable;
+procedure TAPU.Reset;
+begin
+  FCycles := 0;
+end;
+
+procedure TAPU.Step(Cycles: Integer);
+begin
+  Inc(FCycles, Cycles);
 end;
 
 end.
