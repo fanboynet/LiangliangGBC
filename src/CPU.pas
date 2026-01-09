@@ -15,6 +15,7 @@ type
     FEnableIMEPending: Boolean;
     FHalted: Boolean;
     FStopped: Boolean;
+    FHaltBug: Boolean;
     function GetAF: TWord;
     function GetBC: TWord;
     function GetDE: TWord;
@@ -55,6 +56,7 @@ type
     procedure BitTest(Bit: Integer; Value: TByte);
     function GetReg8(Index: Integer): TByte;
     procedure SetReg8(Index: Integer; Value: TByte);
+    function HandleInterrupts: Integer;
   public
     constructor Create(AMemory: TMemory);
     procedure Reset;
@@ -73,6 +75,8 @@ const
   FlagN = $40;
   FlagH = $20;
   FlagC = $10;
+  IFAddress = $FF0F;
+  IEAddress = $FFFF;
 
 constructor TCPU.Create(AMemory: TMemory);
 begin
@@ -92,6 +96,7 @@ begin
   FEnableIMEPending := False;
   FHalted := False;
   FStopped := False;
+  FHaltBug := False;
 end;
 
 function TCPU.GetAF: TWord;
@@ -166,6 +171,10 @@ end;
 function TCPU.FetchByte: TByte;
 begin
   Result := ReadByte(FRegisters.PC);
+  if FHaltBug then
+    FHaltBug := False
+  else
+    Inc(FRegisters.PC);
   Inc(FRegisters.PC);
 end;
 
@@ -474,6 +483,63 @@ begin
     6: WriteByte(GetHL, Value);
     7: FRegisters.A := Value;
   end;
+end;
+
+function TCPU.HandleInterrupts: Integer;
+var
+  InterruptFlags: TByte;
+  InterruptEnable: TByte;
+  Pending: TByte;
+  Vector: TWord;
+begin
+  Result := 0;
+  InterruptFlags := ReadByte(IFAddress);
+  InterruptEnable := ReadByte(IEAddress);
+  Pending := InterruptFlags and InterruptEnable and $1F;
+  if Pending = 0 then
+    Exit;
+
+  if not FIME then
+  begin
+    if FHalted then
+    begin
+      FHalted := False;
+      FHaltBug := True;
+    end;
+    Exit;
+  end;
+
+  FHalted := False;
+  FIME := False;
+  if (Pending and $01) <> 0 then
+  begin
+    Vector := $0040;
+    InterruptFlags := InterruptFlags and not $01;
+  end
+  else if (Pending and $02) <> 0 then
+  begin
+    Vector := $0048;
+    InterruptFlags := InterruptFlags and not $02;
+  end
+  else if (Pending and $04) <> 0 then
+  begin
+    Vector := $0050;
+    InterruptFlags := InterruptFlags and not $04;
+  end
+  else if (Pending and $08) <> 0 then
+  begin
+    Vector := $0058;
+    InterruptFlags := InterruptFlags and not $08;
+  end
+  else
+  begin
+    Vector := $0060;
+    InterruptFlags := InterruptFlags and not $10;
+  end;
+  WriteByte(IFAddress, InterruptFlags);
+  PushWord(FRegisters.PC);
+  FRegisters.PC := Vector;
+  Result := 20;
   FCycles := 0;
 end;
 
@@ -486,6 +552,16 @@ var
   BitIndex: Integer;
   RegIndex: Integer;
   EnableIMEAfter: Boolean;
+  InterruptCycles: Integer;
+begin
+  EnableIMEAfter := FEnableIMEPending;
+  InterruptCycles := HandleInterrupts;
+  if InterruptCycles > 0 then
+  begin
+    Inc(FCycles, InterruptCycles);
+    Result := InterruptCycles;
+    Exit;
+  end;
 begin
   EnableIMEAfter := FEnableIMEPending;
 begin
