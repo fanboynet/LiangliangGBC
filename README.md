@@ -1,7 +1,7 @@
 # LiangliangGBC
 A GameBoy/GameBoy Color emulator written in Pascal(Delphi).
 
-<img src="./screen/cpu_instrs.png" width="300"> <img src="./screen/mario.png" width="300">
+<img src="./screen/cpu_instrs.png" width="200"> <img src="./screen/mario.png" width="200"> <img src="./screen/supermario.png" width="200">
 
 **Controls:**
 - **W/A/S/D**: Up/Left/Down/Right
