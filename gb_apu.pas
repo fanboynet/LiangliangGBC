@@ -1,6 +1,20 @@
-unit gb_apu;
+﻿unit gb_apu;
+{ 单元定义: 音频处理单元（APU）实现。 }
+{ 负责内容: 四通道音频、帧序列器、包络/扫频/长度计数、混音与采样输出。 }
+
+
 
 interface
+
+{
+  APU 近似实现说明:
+  - 按 CPU cycles 推进 4 个声道内部计数器。
+  - 使用 512Hz 帧序列器驱动 length/sweep/envelope。
+  - 通过 NR50/NR51 混音到左右声道，输出 PCM16。
+  - 包含常见硬件细节: DAC 关闭即静音/关通道、NR52 总开关、wave RAM 访问限制。
+  注: 本实现以“可玩+通过常见测试”优先，非 gate-level 精确。
+  参考: Pan Docs / Audio Details.
+}
 
 type
   TAPUSampleProc = procedure(ALeft, ARight: SmallInt) of object;
@@ -9,6 +23,7 @@ type
   private
     const
       GB_CPU_HZ = 4194304.0;
+      { 方波 duty 模板（8-step 波形）。 }
       DUTY_TABLE: array[0..3, 0..7] of Byte = (
         (0,0,0,0,0,0,0,1),
         (1,0,0,0,0,0,0,1),
@@ -19,6 +34,7 @@ type
   private
     type
       TSquareChannel = record
+        { CH1/CH2 共用状态结构。CH1 额外使用 sweep 字段。 }
         Enabled: Boolean;
         DutyStep: Integer;
         FreqTimer: Integer;
@@ -38,6 +54,7 @@ type
       end;
 
       TWaveChannel = record
+        { CH3 波表通道状态。 }
         Enabled: Boolean;
         Position: Integer; { 0..31 samples }
         CurrentByteIndex: Integer; { 0..15 wave RAM byte currently exposed while playing }
@@ -48,6 +65,7 @@ type
       end;
 
       TNoiseChannel = record
+        { CH4 噪声通道状态（15-bit LFSR + 可选 7-bit 模式）。 }
         Enabled: Boolean;
         LFSR: Word;
         FreqTimer: Integer;
@@ -136,46 +154,55 @@ end;
 
 function TGBAPU.GetRegIndex(Addr: Word): Integer;
 begin
+  { FRegs 以 FF10 为基址。 }
   Result := Integer(Addr) - $FF10;
 end;
 
 function TGBAPU.IsApuReg(Addr: Word): Boolean;
 begin
+  { APU 寄存器窗口: FF10..FF3F。 }
   Result := (Addr >= $FF10) and (Addr <= $FF3F);
 end;
 
 function TGBAPU.IsDAC1On: Boolean;
 begin
+  { CH1 DAC: NR12 高 5 位非 0。 }
   Result := (FRegs[$12 - $10] and $F8) <> 0;
 end;
 
 function TGBAPU.IsDAC2On: Boolean;
 begin
+  { CH2 DAC: NR22 高 5 位非 0。 }
   Result := (FRegs[$17 - $10] and $F8) <> 0;
 end;
 
 function TGBAPU.IsDAC3On: Boolean;
 begin
+  { CH3 DAC: NR30 bit7。 }
   Result := (FRegs[$1A - $10] and $80) <> 0;
 end;
 
 function TGBAPU.IsDAC4On: Boolean;
 begin
+  { CH4 DAC: NR42 高 5 位非 0。 }
   Result := (FRegs[$21 - $10] and $F8) <> 0;
 end;
 
 function TGBAPU.Ch1FreqReg: Integer;
 begin
+  { CH1 11-bit frequency = NR13 + NR14[2:0]. }
   Result := FRegs[$13 - $10] or ((FRegs[$14 - $10] and 7) shl 8);
 end;
 
 function TGBAPU.Ch2FreqReg: Integer;
 begin
+  { CH2 11-bit frequency = NR23 + NR24[2:0]. }
   Result := FRegs[$18 - $10] or ((FRegs[$19 - $10] and 7) shl 8);
 end;
 
 function TGBAPU.Ch3FreqReg: Integer;
 begin
+  { CH3 11-bit frequency = NR33 + NR34[2:0]. }
   Result := FRegs[$1D - $10] or ((FRegs[$1E - $10] and 7) shl 8);
 end;
 
@@ -183,6 +210,7 @@ procedure TGBAPU.ReloadCh1Timer;
 var
   D: Integer;
 begin
+  { CH1/CH2 period = (2048 - freq) * 4 cycles。 }
   D := 2048 - Ch1FreqReg;
   if D <= 0 then
     D := 1;
@@ -203,6 +231,7 @@ procedure TGBAPU.ReloadCh3Timer;
 var
   D: Integer;
 begin
+  { CH3 频率步进为 *2 cycles。 }
   D := 2048 - Ch3FreqReg;
   if D <= 0 then
     D := 1;
@@ -213,6 +242,7 @@ procedure TGBAPU.ReloadCh4Timer;
 var
   DivCode, Shift: Integer;
 begin
+  { CH4 period = NOISE_DIVISOR[div] << shift。 }
   DivCode := FRegs[$22 - $10] and 7;
   Shift := (FRegs[$22 - $10] shr 4) and $0F;
   FCh4.FreqTimer := NOISE_DIVISOR[DivCode] shl Shift;
@@ -224,6 +254,8 @@ procedure TGBAPU.TriggerCh1;
 var
   DisableNow: Boolean;
 begin
+  { 触发 CH1（NR14 bit7）:
+    重置相位/计数器，装载 envelope & sweep shadow，并按 DAC/NR52 判定使能。 }
   DisableNow := False;
   FCh1.Enabled := FMasterEnabled and IsDAC1On;
   if FCh1.LengthCounter = 0 then
@@ -249,6 +281,7 @@ end;
 
 procedure TGBAPU.TriggerCh2;
 begin
+  { 触发 CH2（NR24 bit7）。 }
   FCh2.Enabled := FMasterEnabled and IsDAC2On;
   if FCh2.LengthCounter = 0 then
     FCh2.LengthCounter := 64;
@@ -262,6 +295,7 @@ end;
 
 procedure TGBAPU.TriggerCh3;
 begin
+  { 触发 CH3（NR34 bit7）。 }
   FCh3.Enabled := FMasterEnabled and IsDAC3On;
   if FCh3.LengthCounter = 0 then
     FCh3.LengthCounter := 256;
@@ -272,6 +306,7 @@ end;
 
 procedure TGBAPU.TriggerCh4;
 begin
+  { 触发 CH4（NR44 bit7），LFSR 重置为全 1。 }
   FCh4.Enabled := FMasterEnabled and IsDAC4On;
   if FCh4.LengthCounter = 0 then
     FCh4.LengthCounter := 64;
@@ -285,6 +320,7 @@ end;
 
 function TGBAPU.EffectiveEnvelopePeriod(APeriod: Integer): Integer;
 begin
+  { 硬件语义: envelope period=0 视作 8。 }
   if APeriod = 0 then
     Result := 8
   else
@@ -302,6 +338,7 @@ var
   Pos: Integer;
   WaveByte: Byte;
 begin
+  { CH3 每次步进从 wave RAM 取当前 4-bit 样本（高/低半字节交替）。 }
   Pos := FCh3.Position and 31;
   FCh3.CurrentByteIndex := (Pos shr 1) and $0F;
   WaveByte := FRegs[$30 - $10 + FCh3.CurrentByteIndex];
@@ -313,6 +350,7 @@ end;
 
 procedure TGBAPU.ClockLength;
 begin
+  { length 计数到 0 时自动关通道。帧序列器 steps 0/2/4/6 调用。 }
   if FCh1.LengthEnabled and FCh1.Enabled and (FCh1.LengthCounter > 0) then
   begin
     Dec(FCh1.LengthCounter);
@@ -343,6 +381,7 @@ function TGBAPU.ComputeSweepTarget(var DisableChannel: Boolean): Integer;
 var
   Freq, Shift: Integer;
 begin
+  { CH1 sweep 目标频率计算；>2047 会硬件关通道。 }
   DisableChannel := False;
   Freq := FCh1.SweepShadow;
   Shift := FRegs[$10 - $10] and 7;
@@ -367,6 +406,7 @@ var
   SweepPeriod, NewFreq: Integer;
   DisableCh1: Boolean;
 begin
+  { sweep 在帧序列器 steps 2/6 运行。 }
   if not FCh1.Enabled or not FCh1.SweepEnabled then
     Exit;
   Dec(FCh1.SweepCounter);
@@ -397,6 +437,7 @@ end;
 
 procedure TGBAPU.ClockEnvelope;
 begin
+  { 包络在帧序列器 step 7 运行。 }
   if FCh1.Enabled and (FCh1.EnvelopePeriod > 0) then
   begin
     Dec(FCh1.EnvelopeCounter);
@@ -458,6 +499,7 @@ const
 var
   X, Y: Double;
 begin
+  { 简单一阶高通，去除直流偏置（模拟主机耦合电容效果）。 }
   X := InputValue;
   Y := (X - PrevIn) + (R * PrevOut);
   PrevIn := X;
@@ -467,6 +509,8 @@ end;
 
 procedure TGBAPU.ClockFrameSequencer;
 begin
+  { 512Hz 帧序列器:
+    length@0/2/4/6, sweep@2/6, envelope@7。 }
   Inc(FFrameSeqStep);
   FFrameSeqStep := FFrameSeqStep and 7;
 
@@ -482,6 +526,7 @@ function TGBAPU.SampleCh1: Integer;
 var
   Duty: Integer;
 begin
+  { 输出 0..15 数字幅度。 }
   if not FCh1.Enabled then
     Exit(0);
   if not IsDAC1On then
@@ -513,6 +558,7 @@ var
   Raw4: Integer;
   ShiftCode: Integer;
 begin
+  { NR32 衰减码: 0=mute,1=100%,2=50%,3=25%。 }
   if not FCh3.Enabled then
     Exit(0);
   if not IsDAC3On then
@@ -534,6 +580,7 @@ function TGBAPU.SampleCh4: Integer;
 var
   Bit0: Integer;
 begin
+  { LFSR bit0 反相后作为噪声输出位。 }
   if not FCh4.Enabled then
     Exit(0);
   if not IsDAC4On then
@@ -558,6 +605,7 @@ var
   VolL, VolR: Double;
   OutL, OutR: Integer;
 begin
+  { NR51 路由各通道到 L/R，NR50 控制各声道总音量。 }
   if not Assigned(FOnSample) then
     Exit;
   if not FMasterEnabled then
@@ -595,6 +643,7 @@ end;
 
 procedure TGBAPU.UpdateNR52;
 begin
+  { NR52 低 4 位反映各通道当前 on/off 状态。 }
   FRegs[$26 - $10] := (FRegs[$26 - $10] and $F0) or
                       (Ord(FCh1.Enabled) shl 0) or
                       (Ord(FCh2.Enabled) shl 1) or
@@ -606,6 +655,7 @@ procedure TGBAPU.Reset;
 var
   I: Integer;
 begin
+  { 采用 DMG post-boot 默认寄存器，便于无 boot ROM 运行。 }
   for I := 0 to High(FRegs) do
     FRegs[I] := 0;
 
@@ -656,10 +706,15 @@ var
   XorBit: Integer;
   CyclesPerSample: Double;
 begin
+  { APU 主推进:
+    - 先推进 frame sequencer
+    - 再推进各声道频率计时
+    - 最后按采样率抽样输出。 }
   if FSampleRate <= 0 then
     Exit;
 
   FFrameSeqCycles := FFrameSeqCycles + Integer(Cycles);
+  { 4194304 / 512 = 8192 cycles per frame-sequencer tick. }
   while FFrameSeqCycles >= 8192 do
   begin
     Dec(FFrameSeqCycles, 8192);
@@ -731,6 +786,7 @@ function TGBAPU.Read(Addr: Word): Byte;
 var
   I, CurWaveIndex: Integer;
 begin
+  { APU 读寄存器含掩码语义（部分位只读 1 / 不可读）。 }
   if not IsApuReg(Addr) then
     Exit($FF);
   I := GetRegIndex(Addr);
@@ -766,6 +822,8 @@ var
   I, CurWaveIndex: Integer;
   OldLenEnable, NewLenEnable, NeedExtraLenClock: Boolean;
 begin
+  { APU 写寄存器实现关键副作用:
+    trigger、length extra clock、NR52 总开关、wave RAM 访问规则。 }
   if not IsApuReg(Addr) then
     Exit;
 
@@ -947,6 +1005,7 @@ begin
 
     $FF26:
       begin
+        { NR52 bit7=0: APU 掉电，FF10..FF25 清零并重置通道状态。 }
         FMasterEnabled := (Value and $80) <> 0;
         if not FMasterEnabled then
         begin
@@ -966,6 +1025,7 @@ begin
 
     $FF30..$FF3F:
       begin
+        { CH3 播放中写 wave RAM: 近似到“写当前暴露字节”。 }
         if FCh3.Enabled and IsDAC3On then
         begin
           CurWaveIndex := FCh3.CurrentByteIndex and $0F;

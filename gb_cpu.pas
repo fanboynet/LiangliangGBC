@@ -1,15 +1,36 @@
-unit gb_cpu;
+﻿unit gb_cpu;
+{ 单元定义: LR35902 CPU 指令执行核心。 }
+{ 负责内容: 寄存器/标志位维护、取指译码执行、中断响应、HALT/STOP、每条指令周期计数与总线访问回调。 }
+{
+  注释规范（本单元）:
+  1) 为什么这样写: 对齐 LR35902 实机行为与 Pan Docs 约束。
+  2) 这是什么操作: 在关键路径标注指令语义（LD/ADD/JP/BIT 等）。
+  3) 周期数: 通过 FCycles + 4T 总线拍确保时序正确。
+  4) 边缘情况: HALT bug、EI 延迟生效、半进位/借位、条件分支周期差。
+  参考:
+  - Pan Docs: https://gbdev.io/pandocs/
+  - CPU 指令集: https://gbdev.io/pandocs/CPU_Instruction_Set.html
+  - 中断行为: https://gbdev.io/pandocs/Interrupts.html
+}
+
+
 
 { Game Boy (LR35902) CPU unit. Full instruction set, classic Delphi, no generics. }
 
 interface
 
 type
+  { MMU 读总线回调（8-bit）。 }
   TRead8Func = function(Addr: Word): Byte of object;
+  { MMU 写总线回调（8-bit）。 }
   TWrite8Proc = procedure(Addr: Word; Value: Byte) of object;
+  { 时钟推进回调，单位为 T-cycle。 }
   TTickProc = procedure(Cycles: Cardinal) of object;
+  { STOP 指令回调（用于 CGB 速度切换）。 }
   TStopFunc = function: Boolean of object;
+  { CPU 总线访问通知（用于 MMU 的 OAM bug / 监控逻辑）。 }
   TBusAccessProc = procedure(Addr: Word; IsWrite: Boolean) of object;
+  { IDU（内部地址单元）操作通知。 }
   TIDUOpProc = procedure(Addr: Word; Kind: Byte) of object;
 
   TCpu = class
@@ -110,11 +131,17 @@ uses
 {$ENDIF}
 
 const
+  { F 寄存器仅高 4 位有效（Z N H C）。低 4 位硬件上恒为 0。 }
   FLAG_Z = $80;
   FLAG_N = $40;
   FLAG_H = $20;
   FLAG_C = $10;
 
+{ 统一的“时钟记账”入口。
+  为什么:
+  - 指令由多个总线拍组成，不能只在 Step 末尾一次性推进。
+  - MMU/PPU/Timer/APU 都依赖精确时钟推进。
+  参考: Pan Docs -> CPU Timing。 }
 procedure TCpu.TickBus(Cycles: Cardinal);
 begin
   Inc(FStepTickCycles, Cycles);
@@ -123,18 +150,25 @@ begin
     FOnTick(Cycles);
 end;
 
+{ 将本条指令承诺的 FCycles 与已推进时钟对齐。
+  某些路径会提前 Exit（如中断受理），此处保证周期闭合。 }
 procedure TCpu.DrainTicks;
 begin
   if FCycles > FStepTickCycles then
     TickBus(FCycles - FStepTickCycles);
 end;
 
+{ IDU 通知:
+  LR35902 某些地址变化属于“内部地址单元”行为，不等同于普通读写总线。
+  MMU 可用该信息模拟 OAM bug 等硬件细节。 }
 procedure TCpu.NotifyIDUOp(Addr: Word; Kind: Byte);
 begin
   if Assigned(FOnIDUOp) then
     FOnIDUOp(Addr and $FFFF, Kind);
 end;
 
+{ Peek8: 不消耗总线周期的“窥视读取”。
+  用于 IE/IF 判定等场景，避免误增周期。 }
 function TCpu.Peek8(Addr: Word): Byte;
 begin
   Addr := Addr and $FFFF;
@@ -144,6 +178,9 @@ begin
     Result := $FF;
 end;
 
+{ Read8:
+  - 执行一次 8-bit 总线读（4T）。
+  - 并通知 OnBusAccess，供 MMU 做读总线副作用。 }
 function TCpu.Read8(Addr: Word): Byte;
 begin
   TickBus(4);
@@ -152,6 +189,9 @@ begin
     FOnBusAccess(Addr and $FFFF, False);
 end;
 
+{ Write8:
+  - 执行一次 8-bit 总线写（4T）。
+  - 并通知 OnBusAccess，供 MMU 做写总线副作用。 }
 procedure TCpu.Write8(Addr: Word; Value: Byte);
 begin
   TickBus(4);
@@ -162,11 +202,13 @@ begin
     FOnBusAccess(Addr, True);
 end;
 
+{ 16-bit 读采用 little-endian（低字节在前，高字节在后），总计 8T。 }
 function TCpu.Read16(Addr: Word): Word;
 begin
   Result := Read8(Addr) or (Word(Read8((Addr + 1) and $FFFF)) shl 8);
 end;
 
+{ 16-bit 写采用 little-endian，总计 8T。 }
 procedure TCpu.Write16(Addr: Word; Value: Word);
 begin
   Addr := Addr and $FFFF;
@@ -174,6 +216,7 @@ begin
   Write8((Addr + 1) and $FFFF, Byte(Value shr 8));
 end;
 
+{ 标志位读取辅助函数（Z/N/H/C）。 }
 function TCpu.GetZ: Boolean;
 begin
   Result := (FRegF and FLAG_Z) <> 0;
@@ -226,7 +269,11 @@ begin
     FRegF := FRegF and (not FLAG_C);
 end;
 
-{ r8 index: 0=B,1=C,2=D,3=E,4=H,5=L,6=(HL),7=A }
+{ r8 编码表（Pan Docs 指令编码约定）:
+  0=B, 1=C, 2=D, 3=E, 4=H, 5=L, 6=(HL), 7=A
+  注意:
+  - 访问 (HL) 会触发一次真实总线读/写（额外 4T）。
+  - 这也是 LD r,(HL) 与 LD r,r 周期不同的根因。 }
 function TCpu.GetR8(Index: Byte): Byte;
 var
   HL: Word;
@@ -280,6 +327,8 @@ end;
 
 procedure TCpu.Reset;
 begin
+  { 这里采用“Boot ROM 结束后”常用初值（直接从 $0100 开跑）。
+    说明: 这是模拟器常见快速启动策略，不是严格上电随机态。 }
   FRegA := $01;   { DMG boot ROM passes $01 when jumping to $100 }
   FRegF := $B0;   { DMG post-boot flags }
   FRegB := 0;
@@ -300,6 +349,9 @@ begin
 end;
 
 const
+  { 中断入口向量（按优先级顺序）:
+    VBlank, LCD STAT, Timer, Serial, Joypad
+    参考: Pan Docs -> Interrupts。 }
   IRQ_VECTORS: array[0..4] of Word = ($40, $48, $50, $58, $60);
 
 procedure TCpu.Step;
@@ -314,6 +366,7 @@ var
   HL, BC, DE: Word;
   IE, IFreg, CurIF: Byte;
   I: Integer;
+  { 以下局部过程用于把“栈/PC 的地址变化”拆成与硬件一致的 IDU 粒度。 }
   procedure SPDec1;
   begin
     NotifyIDUOp(FSP, 0);
@@ -355,6 +408,9 @@ var
   var
     Lo, Hi: Byte;
   begin
+    { RET/RETI/POP 的弹栈路径:
+      这里把两次 SP 自增拆开并发出不同 Kind（3/4），用于 MMU 侧复现
+      OAM bug 的 RET/POP 特殊时序差异。 }
     Lo := Read8(FSP);
     NotifyIDUOp(FSP, 3);
     FSP := (FSP + 1) and $FFFF;
@@ -364,10 +420,20 @@ var
     Result := Word(Lo) or (Word(Hi) shl 8);
   end;
 begin
+  { Step 执行流程（教学视角）:
+    1) 处理 STOP/HALT 暂停态与唤醒条件
+    2) 若 IME=1 且有 pending IRQ，优先受理中断
+    3) 取指（含 HALT bug 的 PC 行为）
+    4) 执行 opcode，并设置 FCycles
+    5) 处理 EI 延迟生效，再用 DrainTicks 校准周期
+
+    参考:
+    - Pan Docs: Interrupts / HALT / STOP / Instruction Set。 }
   FCycles := 0;
   FStepTickCycles := 0;
   if FStopped then
   begin
+    { STOP 状态下，无中断则仅空转 4T。 }
     if (Peek8($FFFF) and Peek8($FF0F) and $1F) = 0 then
     begin
       FCycles := 4;
@@ -378,6 +444,9 @@ begin
   end;
   if FHalted then
   begin
+    { HALT 状态下:
+      - 无 pending IRQ: 每步空转 4T
+      - 有 pending IRQ: 立即唤醒；IME=1 时本步可进入中断受理 }
     if (Peek8($FFFF) and Peek8($FF0F) and $1F) = 0 then
     begin
       FCycles := 4;
@@ -394,7 +463,9 @@ begin
     end;
   end;
 
-  { Service interrupt if IME set and pending (priority: VBlank, STAT, Timer, Serial, Joypad) }
+  { 中断受理（IME=1 才允许）:
+    - 优先级固定: VBlank > STAT > Timer > Serial > Joypad
+    - 典型时序: 2 个空 M-cycle + Push PC + 跳向向量（总计约 20T） }
   if FIME then
   begin
     IE := Peek8($FFFF);
@@ -423,6 +494,9 @@ begin
       end;
   end;
 
+  { 取指:
+    普通情况下取指后 PC+1。
+    若触发 HALT bug，本次取指不自增 PC（下一条从同地址再次取）。 }
   Opcode := Read8(FPC);
   if FHaltBug then
     FHaltBug := False
@@ -434,7 +508,9 @@ begin
     WriteLn(Format('PC=$%.4x OP=$%.2x', [FPC - 1, Opcode]));
 
   case Opcode of
+    { $00-$3F: 基础控制流、8/16位装载、算术旋转、相对跳转。 }
     $00: ; { NOP }
+    { LD r16,d16 / LD (r16),A / INC/DEC r16 这组指令用于 16-bit 地址寄存器准备与更新。 }
     $01: begin
            Imm16 := Read16(FPC); PCInc2;
            FRegB := Byte(Imm16 shr 8); FRegC := Byte(Imm16 and $FF);
@@ -453,6 +529,8 @@ begin
            FCycles := 8;
          end;
     $04: begin
+           { INC r:
+             标志位: Z 按结果，N=0，H 按低 4 位是否溢出（0x0F->0x10）。 }
            Inc(FRegB);
            SetZ(FRegB = 0);
            SetN(False);
@@ -460,6 +538,8 @@ begin
            FCycles := 4;
          end;
     $05: begin
+           { DEC r:
+             标志位: Z 按结果，N=1，H 按低 4 位是否借位（0x00->0x0F）。 }
            Dec(FRegB);
            SetZ(FRegB = 0);
            SetN(True);
@@ -471,6 +551,7 @@ begin
            FCycles := 8;
          end;
     $07: begin { RLCA }
+           { 非 CB 旋转类（RLCA/RRCA/RLA/RRA）统一规则: Z 强制清零。 }
            Tmp8 := (FRegA shr 7) and 1;
            FRegA := ((FRegA shl 1) or Tmp8) and $FF;
            SetZ(False);
@@ -485,6 +566,9 @@ begin
            FCycles := 20;
          end;
     $09: begin
+           { ADD HL,BC（16-bit）:
+             N=0；H 检查 bit11 进位；C 检查 bit15 进位；Z 保持不变。
+             参考: Pan Docs -> CPU Instruction Set / ADD HL,r16。 }
            HL := GetHL;
            BC := (Word(FRegB) shl 8) or FRegC;
            Tmp32 := Cardinal(HL) + Cardinal(BC);
@@ -534,6 +618,8 @@ begin
            FCycles := 4;
          end;
     $10: begin { STOP; next byte consumed }
+           { STOP 会吞掉后续 1 字节（硬件行为）。
+             在 CGB 场景下通过 OnStop 回调处理倍速切换。 }
            Read8(FPC);
            PCInc1;
            if Assigned(FOnStop) and FOnStop then
@@ -583,6 +669,7 @@ begin
            FCycles := 8;
          end;
     $17: begin { RLA }
+           { RLA: A 左移一位并经由 C 循环（旧 bit7 -> C，旧 C -> bit0）。 }
            Tmp8 := Byte(Ord(GetC));
            SetC((FRegA and $80) <> 0);
            FRegA := ((FRegA shl 1) or Tmp8) and $FF;
@@ -597,6 +684,7 @@ begin
            FCycles := 12;
          end;
     $19: begin
+           { ADD HL,DE，与 ADD HL,BC 标志位规则相同。 }
            HL := GetHL;
            DE := (Word(FRegD) shl 8) or FRegE;
            Tmp32 := Cardinal(HL) + Cardinal(DE);
@@ -637,6 +725,7 @@ begin
            FCycles := 8;
          end;
     $1F: begin { RRA }
+           { RRA: A 右移一位并经由 C 循环（旧 bit0 -> C，旧 C -> bit7）。 }
            Tmp8 := Byte(Ord(GetC));
            SetC((FRegA and 1) <> 0);
            FRegA := (FRegA shr 1) or (Tmp8 shl 7);
@@ -646,6 +735,8 @@ begin
            FCycles := 4;
          end;
     $20: begin { JR NZ }
+           { 条件 JR 周期:
+             条件成立（跳转）=12T；不成立=8T。 }
            Imm8 := Read8(FPC); PCInc1;
            if not GetZ then
            begin
@@ -661,6 +752,8 @@ begin
            FCycles := 12;
          end;
     $22: begin
+           { LD (HL+),A:
+             内存写完成后 HL 自增。此处发出 Kind=2 的 IDU 通知。 }
            HL := GetHL;
            Write8(HL, FRegA);
            NotifyIDUOp(HL, 2);
@@ -692,6 +785,9 @@ begin
            FCycles := 8;
          end;
     $27: begin { DAA }
+           { DAA（十进制调整）是最易错指令之一。
+             规则依赖上一条是否减法（N 标志）以及 C/H 当前值。
+             参考: Pan Docs -> CPU Instruction Set / DAA。 }
            Tmp8 := FRegA;
            if not GetN then
            begin
@@ -719,6 +815,8 @@ begin
              FCycles := 8;
          end;
     $29: begin
+           { ADD HL,HL:
+             仍按 16-bit ADD 规则计算 H/C（不是按 8-bit）。 }
            HL := GetHL;
            Tmp32 := Cardinal(HL) + Cardinal(HL);
            SetN(False);
@@ -728,6 +826,8 @@ begin
            FCycles := 8;
          end;
     $2A: begin
+           { LD A,(HL+):
+             读内存后 HL 自增。Kind=1 用于区分读后自增路径。 }
            HL := GetHL;
            FRegA := Read8(HL);
            NotifyIDUOp(HL, 1);
@@ -775,11 +875,14 @@ begin
              FCycles := 8;
          end;
     $31: begin
+           { LD SP,d16: 常用于函数栈初始化与上下文切换前准备。 }
            Imm16 := Read16(FPC); PCInc2;
            FSP := Imm16;
            FCycles := 12;
          end;
     $32: begin
+           { LD (HL-),A:
+             写内存后 HL 自减。 }
            HL := GetHL;
            Write8(HL, FRegA);
            NotifyIDUOp(HL, 2);
@@ -791,6 +894,8 @@ begin
            FCycles := 8;
          end;
     $34: begin
+           { INC (HL) / DEC (HL) 是“读-改-写”三段式:
+             读 4T + 写 4T + 额外内部时序，最终 12T。 }
            HL := GetHL;
            Tmp8 := Read8(HL);
            Inc(Tmp8);
@@ -817,6 +922,7 @@ begin
            FCycles := 12;
          end;
     $37: begin { SCF }
+           { SCF: C=1, N=0, H=0, Z 不变。 }
            SetN(False);
            SetH(False);
            SetC(True);
@@ -833,6 +939,7 @@ begin
              FCycles := 8;
          end;
     $39: begin
+           { ADD HL,SP，与 ADD HL,r16 相同标志位规则。 }
            HL := GetHL;
            Tmp32 := Cardinal(HL) + Cardinal(FSP);
            SetN(False);
@@ -842,6 +949,8 @@ begin
            FCycles := 8;
          end;
     $3A: begin
+           { LD A,(HL-):
+             读内存后 HL 自减。 }
            HL := GetHL;
            FRegA := Read8(HL);
            NotifyIDUOp(HL, 1);
@@ -871,12 +980,17 @@ begin
            FCycles := 8;
          end;
     $3F: begin { CCF }
+           { CCF: C 取反，N=0，H=0，Z 不变。 }
            SetN(False);
            SetH(False);
            SetC(not GetC);
            FCycles := 4;
          end;
+    { $40-$7F: 8-bit LD 矩阵与 HALT。 }
     $40..$75, $77..$7F: begin { LD r8, r8 (excluding $76 = HALT) }
+           { LD r,r:
+             - 寄存器到寄存器: 4T
+             - 涉及 (HL) 的读或写: 8T（多一次总线访问） }
            SetR8((Opcode shr 3) and 7, GetR8(Opcode and 7));
            if ((Opcode and 7) = 6) or (((Opcode shr 3) and 7) = 6) then
              FCycles := 8
@@ -884,13 +998,19 @@ begin
              FCycles := 4;
          end;
     $76: begin { HALT }
+           { HALT bug:
+             IME=0 且存在 pending IRQ 时，CPU 不真正 Halt，但下一次取指 PC 不自增。
+             参考: Pan Docs -> HALT。 }
            if (not FIME) and ((Peek8($FFFF) and Peek8($FF0F) and $1F) <> 0) then
              FHaltBug := True
            else
              FHalted := True;
            FCycles := 4;
          end;
+    { $80-$BF: 8-bit ALU 组（ADD/ADC/SUB/SBC/AND/XOR/OR/CP）。 }
     $80..$87: begin { ADD A, r8 }
+           { 8-bit 加法族（ADD/ADC）:
+             H 标志使用低 4 位进位规则，C 标志使用 8-bit 溢出规则。 }
            Tmp8 := GetR8(Opcode and 7);
            SetZ((FRegA + Tmp8) and $FF = 0);
            SetN(False);
@@ -910,6 +1030,8 @@ begin
            if (Opcode and 7) = 6 then FCycles := 8 else FCycles := 4;
          end;
     $90..$97: begin { SUB A, r8 }
+           { 8-bit 减法族（SUB/SBC/CP）:
+             H 标志表示低 4 位借位，C 标志表示整体借位。 }
            Tmp8 := GetR8(Opcode and 7);
            SetZ((FRegA - Tmp8) and $FF = 0);
            SetN(True);
@@ -953,6 +1075,7 @@ begin
            if (Opcode and 7) = 6 then FCycles := 8 else FCycles := 4;
          end;
     $B8..$BF: begin { CP A, r8 }
+           { CP: 按减法更新标志位，但 A 不写回。 }
            Tmp8 := GetR8(Opcode and 7);
            SetZ(FRegA = Tmp8);
            SetN(True);
@@ -960,7 +1083,10 @@ begin
            SetC(FRegA < Tmp8);
            if (Opcode and 7) = 6 then FCycles := 8 else FCycles := 4;
          end;
+    { $C0-$FF: 控制流、栈、立即数 ALU、IO 高页访问、中断控制。 }
     $C0: begin { RET NZ }
+           { 条件 RET 周期:
+             成立（执行弹栈）=20T；不成立=8T。 }
            if not GetZ then
            begin
              FPC := Pop16IsRetFamily;
@@ -970,6 +1096,7 @@ begin
              FCycles := 8;
          end;
     $C1: begin
+           { POP r16: 从栈弹出低字节+高字节，周期固定 12T。 }
            Tmp16 := Pop16IsRetFamily;
            FRegB := Byte(Tmp16 shr 8);
            FRegC := Byte(Tmp16 and $FF);
@@ -991,6 +1118,8 @@ begin
            FCycles := 16;
          end;
     $C4: begin { CALL NZ, imm16 }
+           { 条件 CALL 周期:
+             成立（压栈+跳转）=24T；不成立=12T。 }
            Imm16 := Read16(FPC); PCInc2;
            if not GetZ then
            begin
@@ -1002,10 +1131,12 @@ begin
              FCycles := 12;
          end;
     $C5: begin
+           { PUSH r16: 先写高字节再写低字节，SP 向下增长。 }
            Push16((Word(FRegB) shl 8) or FRegC);
            FCycles := 16;
          end;
     $C6: begin
+           { ADD A,d8: 与 ADD A,r 的标志位计算一致，仅操作数来源不同。 }
            Imm8 := Read8(FPC); PCInc1;
            SetZ((FRegA + Imm8) and $FF = 0);
            SetN(False);
@@ -1015,6 +1146,7 @@ begin
            FCycles := 8;
          end;
     $C7: begin
+           { RST 00h（固定向量调用）。 }
            Push16(FPC);
            FPC := $00;
            FCycles := 16;
@@ -1029,6 +1161,7 @@ begin
              FCycles := 8;
          end;
     $C9: begin
+           { RET（无条件）固定 16T。 }
            FPC := Pop16IsRetFamily;
            FCycles := 16;
          end;
@@ -1046,8 +1179,14 @@ begin
            CBByte := Read8(FPC);
            PCInc1;
            FCycles := 8;
-           { CB prefix handled below in separate block }
+           { CB 前缀扩展指令:
+             基础周期 8T；若目标是 (HL)，再追加 8T（总 16T）。
+             参考: Pan Docs -> Prefix Opcodes。 }
            case CBByte of
+             { RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL:
+               - 对寄存器目标: 8T
+               - 对 (HL) 目标: 16T
+               - 绝大多数会写回并更新 Z/N/H/C（与非 CB 旋转指令不同）。 }
              $00..$07: begin { RLC r8 }
                         Tmp8 := GetR8(CBByte and 7);
                         Tmp16 := (Tmp8 shl 1) or (Tmp8 shr 7);
@@ -1128,6 +1267,8 @@ begin
                         SetH(False);
                         if (CBByte and 7) = 6 then Inc(FCycles, 8);
                       end;
+             { BIT b,r:
+               只测试位，不写回目标。N=0, H=1, C 保持不变。 }
              $40..$7F: begin { BIT b, r8 }
                         Tmp8 := GetR8(CBByte and 7);
                         SetZ((Tmp8 and (1 shl ((CBByte shr 3) and 7))) = 0);
@@ -1135,6 +1276,8 @@ begin
                         SetH(True);
                         if (CBByte and 7) = 6 then Inc(FCycles, 4);
                       end;
+             { RES/SET:
+               对目标位清零/置位，不修改 Z/N/H/C。 }
              $80..$BF: begin { RES b, r8 }
                         Tmp8 := GetR8(CBByte and 7);
                         Tmp8 := Tmp8 and (not (1 shl ((CBByte shr 3) and 7)));
@@ -1150,6 +1293,7 @@ begin
            end;
            if FIMEDelaySteps > 0 then
            begin
+             { CB 指令同样算“下一条指令”，因此会推进 EI 延迟计数。 }
              Dec(FIMEDelaySteps);
              if FIMEDelaySteps = 0 then
                FIME := True;
@@ -1169,12 +1313,14 @@ begin
              FCycles := 12;
          end;
     $CD: begin
+           { CALL a16: Push 返回地址后跳转，固定 24T。 }
            Imm16 := Read16(FPC); PCInc2;
            Push16(FPC);
            FPC := Imm16;
            FCycles := 24;
          end;
     $CE: begin
+           { ADC A,d8: 把当前 C 作为第 3 个加数参与。 }
            Imm8 := Read8(FPC); PCInc1;
            Tmp16 := FRegA + Imm8 + Byte(Ord(GetC));
            SetZ(Byte(Tmp16 and $FF) = 0);
@@ -1185,6 +1331,7 @@ begin
            FCycles := 8;
          end;
     $CF: begin
+           { RST 08h。 }
            Push16(FPC);
            FPC := $08;
            FCycles := 16;
@@ -1229,8 +1376,10 @@ begin
            Push16((Word(FRegD) shl 8) or FRegE);
            FCycles := 16;
          end;
-    $D3, $DB, $DD, $E3, $E4, $EB, $EC, $ED, $F4, $FC, $FD: ; { Invalid: NOP (no lock) }
+    { LR35902 未定义 opcode（不会像某些 Z80 进入锁死），此实现按 NOP 处理。 }
+    $D3, $DB, $DD, $E3, $E4, $EB, $EC, $ED, $F4, $FC, $FD: ;
     $D6: begin
+           { SUB A,d8: 与 SUB A,r 的借位/半借位规则一致。 }
            Imm8 := Read8(FPC); PCInc1;
            SetZ((FRegA - Imm8) and $FF = 0);
            SetN(True);
@@ -1254,6 +1403,7 @@ begin
              FCycles := 8;
          end;
     $D9: begin { RETI }
+           { RETI: 立即 IME=1（不同于 EI 的延迟生效）。 }
            FPC := Pop16IsRetFamily;
            FIME := True;
            FCycles := 16;
@@ -1280,6 +1430,7 @@ begin
              FCycles := 12;
          end;
     $DE: begin
+           { SBC A,d8: 减法时把当前 C 当作借位输入。 }
            Imm8 := Read8(FPC); PCInc1;
            Tmp16S := Integer(FRegA) - Integer(Imm8) - Integer(Ord(GetC));
            SetZ(Byte(Tmp16S and $FF) = 0);
@@ -1290,30 +1441,36 @@ begin
            FCycles := 8;
          end;
     $DF: begin
+           { RST 18h。 }
            Push16(FPC);
            FPC := $18;
            FCycles := 16;
          end;
     $E0: begin
+           { LDH (a8),A: 写入 $FF00 + imm8（高页 IO 寄存器区）。 }
            Imm8 := Read8(FPC); PCInc1;
            Write8($FF00 or Imm8, FRegA);
            FCycles := 12;
          end;
     $E1: begin
+           { POP HL。 }
            Tmp16 := Pop16IsRetFamily;
            FRegH := Byte(Tmp16 shr 8);
            FRegL := Byte(Tmp16 and $FF);
            FCycles := 12;
          end;
     $E2: begin
+           { LD (C),A: 写入 $FF00 + C。 }
            Write8($FF00 or FRegC, FRegA);
            FCycles := 8;
          end;
     $E5: begin
+           { PUSH HL。 }
            Push16(GetHL);
            FCycles := 16;
          end;
     $E6: begin
+           { AND A,d8: H 恒置 1，N/C 清零（LR35902 约定）。 }
            Imm8 := Read8(FPC); PCInc1;
            FRegA := FRegA and Imm8;
            SetZ(FRegA = 0);
@@ -1323,11 +1480,16 @@ begin
            FCycles := 8;
          end;
     $E7: begin
+           { RST 20h。 }
            Push16(FPC);
            FPC := $20;
            FCycles := 16;
          end;
     $E8: begin { ADD SP, imm8 }
+           { ADD SP,e8:
+             e8 为有符号 8-bit 立即数。
+             Z=0, N=0，H/C 只按低字节加法计算（不是按 16-bit 全宽）。
+             这是与普通 16-bit ADD 不同的关键点。 }
            Imm8 := Read8(FPC); PCInc1;
            Tmp16 := (FSP + ShortInt(Imm8)) and $FFFF;
            SetZ(False);
@@ -1342,11 +1504,13 @@ begin
            FCycles := 4;
          end;
     $EA: begin
+           { LD (a16),A: 16-bit 绝对地址写。 }
            Imm16 := Read16(FPC); PCInc2;
            Write8(Imm16, FRegA);
            FCycles := 16;
          end;
     $EE: begin
+           { XOR A,d8: N/H/C 清零，仅 Z 由结果决定。 }
            Imm8 := Read8(FPC); PCInc1;
            FRegA := FRegA xor Imm8;
            SetZ(FRegA = 0);
@@ -1356,35 +1520,42 @@ begin
            FCycles := 8;
          end;
     $EF: begin
+           { RST 28h。 }
            Push16(FPC);
            FPC := $28;
            FCycles := 16;
          end;
     $F0: begin
+           { LDH A,(a8): 读取 $FF00 + imm8。 }
            Imm8 := Read8(FPC); PCInc1;
            FRegA := Read8($FF00 or Imm8);
            FCycles := 12;
          end;
     $F1: begin
+           { POP AF: F 的低 4 bit 无效，必须清零（and $F0）。 }
            Tmp16 := Pop16IsRetFamily;
            FRegA := Byte(Tmp16 shr 8);
            FRegF := Byte(Tmp16 and $F0);
            FCycles := 12;
          end;
     $F2: begin
+           { LD A,(C): 读取 $FF00 + C。 }
            FRegA := Read8($FF00 or FRegC);
            FCycles := 8;
          end;
     $F3: begin
+           { DI: 立即关中断（IME 立刻清零）。 }
            FIME := False;
            FIMEDelaySteps := 0;
            FCycles := 4;
          end;
     $F5: begin
+           { PUSH AF: F 的低 4 bit 已在写入前屏蔽。 }
            Push16((Word(FRegA) shl 8) or (FRegF and $F0));
            FCycles := 16;
          end;
     $F6: begin
+           { OR A,d8: N/H/C 清零，仅 Z 按结果。 }
            Imm8 := Read8(FPC); PCInc1;
            FRegA := FRegA or Imm8;
            SetZ(FRegA = 0);
@@ -1394,11 +1565,15 @@ begin
            FCycles := 8;
          end;
     $F7: begin
+           { RST 30h。 }
            Push16(FPC);
            FPC := $30;
            FCycles := 16;
          end;
     $F8: begin { LD HL, SP+imm8 }
+           { LD HL,SP+e8:
+             标志位规则与 ADD SP,e8 完全一致（Z=0,N=0，H/C 按低字节）。
+             参考: Pan Docs -> Instruction Set（ADD SP,e8 / LD HL,SP+e8）。 }
            Imm8 := Read8(FPC); PCInc1;
            Tmp16 := (FSP + ShortInt(Imm8)) and $FFFF;
            SetHL(Tmp16);
@@ -1409,19 +1584,24 @@ begin
            FCycles := 12;
          end;
     $F9: begin
+           { LD SP,HL: 不改标志位，固定 8T。 }
            FSP := GetHL;
            FCycles := 8;
          end;
     $FA: begin
+           { LD A,(a16): 16-bit 绝对地址读。 }
            Imm16 := Read16(FPC); PCInc2;
            FRegA := Read8(Imm16);
            FCycles := 16;
          end;
     $FB: begin
+           { EI 延迟生效:
+             IME 不会在本条 EI 结束时立刻置 1，而是在“下一条指令后”生效。 }
            FIMEDelaySteps := 2;
            FCycles := 4;
          end;
     $FE: begin
+           { CP A,d8: 与 SUB A,d8 同标志位规则，但不回写 A。 }
            Imm8 := Read8(FPC); PCInc1;
            SetZ(FRegA = Imm8);
            SetN(True);
@@ -1430,16 +1610,18 @@ begin
            FCycles := 8;
          end;
     $FF: begin
+           { RST 38h。 }
            Push16(FPC);
            FPC := $38;
            FCycles := 16;
          end;
   else
-    { Unknown opcode: treat as NOP }
+    { 未实现/非法 opcode: 按 NOP 处理，保持模拟器健壮性。 }
   end;
 
   if FIMEDelaySteps > 0 then
   begin
+    { 统一处理 EI 延迟计数。 }
     Dec(FIMEDelaySteps);
     if FIMEDelaySteps = 0 then
       FIME := True;
