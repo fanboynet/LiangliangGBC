@@ -1,6 +1,18 @@
-unit gb_joypad;
+﻿unit gb_joypad;
+{ 单元定义: 手柄输入寄存器（P1）抽象层。 }
+{ 负责内容: 按键状态映射、行选择、下降沿触发 Joypad 中断请求。 }
+
+
 
 interface
+
+{
+  Joypad(P1/FF00) 模型:
+  - bit4/bit5 由 CPU 选择行（方向键行 / 按钮键行）。
+  - bit0..3 为低有效（0=按下, 1=松开）。
+  - 任一可见键位出现 1->0 下降沿时请求 Joypad IRQ(bit4)。
+  参考: Pan Docs / Joypad Input.
+}
 
 type
   TJoypadIrqProc = procedure(IrqBit: Byte) of object;
@@ -27,6 +39,7 @@ function TGBJoypad.BuildP1Value: Byte;
 var
   LowNibble: Byte;
 begin
+  { 高两位通常读作 1；中间选择位保留 CPU 最近写入。 }
   Result := $C0 or (FP1Select and $30);
   LowNibble := $0F;
 
@@ -61,6 +74,7 @@ procedure TGBJoypad.SetState(AButtons, ADirections: Byte);
 var
   OldP1, NewP1: Byte;
 begin
+  { AButtons/ADirections 约定为低 4 位，1=松开，0=按下。 }
   OldP1 := BuildP1Value;
   FButtons := AButtons and $0F;
   FDirections := ADirections and $0F;
@@ -77,6 +91,7 @@ procedure TGBJoypad.WriteP1(Value: Byte);
 var
   OldP1, NewP1: Byte;
 begin
+  { 仅 bit4/bit5 可写，其余位忽略。 }
   OldP1 := BuildP1Value;
   FP1Select := Value and $30;
   NewP1 := BuildP1Value;
