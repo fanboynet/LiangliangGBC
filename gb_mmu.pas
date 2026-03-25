@@ -1,4 +1,18 @@
-unit gb_mmu;
+﻿unit gb_mmu;
+{ 单元定义: Game Boy 内存管理单元（MMU）与总线路由层。 }
+{ 负责内容: 地址映射、卡带/VRAM/WRAM/OAM/IO 访问、DMA/HDMA、CGB 双速与外设桥接（PPU/APU/Timer/Joypad）。 }
+
+
+
+{
+  注释规范（与 gb_cpu.pas 一致）:
+  - 说明“为什么要这样映射/时序推进”，而不仅是“做了什么”。
+  - 涉及寄存器行为时尽量写明硬件位语义与兼容取舍。
+  - 涉及 DMA/HDMA/OAM bug/双速时写明与测试 ROM 的关系。
+  - 参考:
+    Pan Docs: https://gbdev.io/pandocs/
+    Memory Map / I/O Ports / OAM DMA Transfer / VRAM DMA Transfers / CGB Registers。
+}
 
 { Game Boy MMU: memory map, echo RAM, IO. Read8/Write8 with case on high byte. }
 
@@ -49,6 +63,16 @@ type
     FDMA: Byte;
     FDMAActive: Boolean;
     FDMACycles: Cardinal;
+    FHDMA1: Byte;
+    FHDMA2: Byte;
+    FHDMA3: Byte;
+    FHDMA4: Byte;
+    FHDMA5: Byte;
+    FHDMASource: Word;
+    FHDMADest: Word;
+    FHDMABlocksRemaining: Byte;
+    FHDMAActive: Boolean;
+    FHDMAHBlank: Boolean;
     FVRAMWriteCount: Cardinal;
     FVRAMMaxByte: Byte;
     FOnSerialByte: TSerialByteProc;
@@ -65,6 +89,8 @@ type
     procedure RequestIrq(IrqBit: Byte);
     procedure CopyVRAMToDisplay;
     procedure UpdateSerial(Cycles: Cardinal);
+    procedure ExecuteHDMABlock;
+    procedure MaybeStepHBlankHDMA(OldMode, NewMode: Byte; OldLY: Byte; Cycles: Cardinal);
     function Read8ForDisplay(Addr: Word): Byte;
     function Read8ForPPU(Addr: Word): Byte;
     function ReadVRAMBankedForDisplay(Addr: Word; Bank: Byte): Byte;
@@ -102,6 +128,7 @@ type
     property Key1Writes: Cardinal read FKey1Writes;
     property StopSwitches: Cardinal read FStopSwitches;
     property IsCGBMode: Boolean read FCGBMode;
+    property IsDoubleSpeed: Boolean read FDoubleSpeed;
     property ForceCGBMode: Boolean read FForceCGBMode write FForceCGBMode;
     function ReadCGBPaletteColor(IsOBJ: Boolean; PaletteIndex, ColorIndex: Byte): Word;
   end;
@@ -110,6 +137,9 @@ implementation
 
 function TGBMMU.WRAMBank1To7: Byte;
 begin
+  { FF70(SVBK):
+    - CGB only.
+    - value 0 maps to bank 1 (hardware behavior), never to bank 0 in $D000-$DFFF. }
   if not FCGBMode then
     Exit(1);
   Result := FSVBK and 7;
@@ -119,6 +149,7 @@ end;
 
 function TGBMMU.VRAMBank0or1: Byte;
 begin
+  { FF4F(VBK): CGB VRAM bank selector (0/1). DMG always uses bank 0. }
   if not FCGBMode then
     Exit(0);
   Result := FVBK and 1;
@@ -127,6 +158,7 @@ end;
 constructor TGBMMU.Create;
 begin
   inherited Create;
+  { MMU owns and wires all core peripherals. CPU callbacks are connected by gb_core. }
   FJoypad := TGBJoypad.Create;
   FJoypad.OnRequestIrq := RequestIrq;
   FAPU := TGBAPU.Create;
@@ -158,6 +190,8 @@ var
   A0, B0, C0: Word;
   I: Integer;
 begin
+  { DMG OAM bug（mode 2）中的“读导致损坏”模式。
+    这里按 mealybug test 所需模式对当前/前一行 8-byte entry 做组合。 }
   if (Row <= 0) or (Row > 19) then
     Exit;
   Base := Row * 8;
@@ -178,6 +212,7 @@ var
   A0, B0, C0: Word;
   I: Integer;
 begin
+  { DMG OAM bug（mode 2）中的“写导致损坏”模式。 }
   if (Row <= 0) or (Row > 19) then
     Exit;
   Base := Row * 8;
@@ -198,6 +233,8 @@ var
   A, B, C, D: Word;
   I: Integer;
 begin
+  { DMG OAM bug 中“同 M-cycle 读+写叠加”模式。
+    该模式与单纯读/写不同，是 oam_bug 7/8 通过的关键之一。 }
   if (Row >= 4) and (Row <= 18) then
   begin
     B2 := (Row - 2) * 8;
@@ -222,6 +259,8 @@ procedure TGBMMU.TriggerOAMBug(Kind: Byte; Addr: Word);
 var
   Row: Integer;
 begin
+  { 仅在 OAM 区 + mode2 扫描阶段触发。
+    CGB 硬件不存在 DMG 同款 OAM corruption，因此外层会在 CGB 禁用。 }
   if (Addr < $FE00) or (Addr > $FEFF) then
     Exit;
   if not Assigned(FPPU) then
@@ -242,6 +281,7 @@ procedure TGBMMU.ApplyOAMCorruptionKind(AKind: Byte);
 var
   Row: Integer;
 begin
+  { 以“当前扫描到的 OAM 行”为目标应用损坏模型。 }
   if not Assigned(FPPU) or (not FPPU.InMode2) then
     Exit;
   Row := FPPU.CurrentOAMRow;
@@ -256,6 +296,14 @@ end;
 
 procedure TGBMMU.FlushPendingBusOAM(const CurrentTicks: UInt64);
 begin
+  { 将上一回调里缓存的总线访问在“跨 M-cycle 边界”时真正落地，
+    以便和同 M-cycle 的 IDU 操作组合（匹配 mealybug OAM 时序）。 }
+  if FCGBMode then
+  begin
+    FPendingBusOAMValid := False;
+    Exit;
+  end;
+
   if not FPendingBusOAMValid then
     Exit;
   if FPendingBusTicks <> CurrentTicks then
@@ -282,6 +330,7 @@ procedure TGBMMU.Reset;
 var
   I: Integer;
 begin
+  { Reset 选择“无 boot ROM 直入”的常见初值风格，兼顾测试 ROM 可运行性。 }
   for I := 0 to 32767 do
   begin
     FWRAM[I] := 0;
@@ -307,6 +356,16 @@ begin
   FDMA := 0;
   FDMAActive := False;
   FDMACycles := 0;
+  FHDMA1 := 0;
+  FHDMA2 := 0;
+  FHDMA3 := 0;
+  FHDMA4 := 0;
+  FHDMA5 := $FF;
+  FHDMASource := 0;
+  FHDMADest := $8000;
+  FHDMABlocksRemaining := 0;
+  FHDMAActive := False;
+  FHDMAHBlank := False;
   FVRAMWriteCount := 0;
   FVRAMMaxByte := 0;
   FPendingBusOAMValid := False;
@@ -350,6 +409,7 @@ procedure TGBMMU.CopyVRAMToDisplay;
 var
   I: Integer;
 begin
+  { 帧开始时做 VRAM 快照，渲染阶段读取快照，降低“写入中撕裂”差异。 }
   for I := 0 to 16383 do
     FVRAMDisplay[I] := FVRAM[I];
 end;
@@ -358,6 +418,10 @@ procedure TGBMMU.UpdateSerial(Cycles: Cardinal);
 var
   ByteCycles: Cardinal;
 begin
+  { 串口内部时钟:
+    - DMG 常规 4096 cycles/byte
+    - CGB 可切到高速（SC bit1）128 cycles/byte
+    - 双速下再减半。完成后请求 Serial IRQ(bit3)。 }
   if not FSerialActive then
     Exit;
 
@@ -380,10 +444,76 @@ begin
   end;
 end;
 
+procedure TGBMMU.ExecuteHDMABlock;
+var
+  I: Integer;
+  Src: Word;
+  Dst: Word;
+  Off: Word;
+  Bank: Byte;
+begin
+  { CGB VRAM DMA 一次传 16 字节（Pan Docs: VRAM DMA Transfers）。
+    General DMA: 一次传完整长度；HBlank DMA: 每次 HBlank 传一个 block。 }
+  if not FCGBMode then
+    Exit;
+  if FHDMABlocksRemaining = 0 then
+    Exit;
+
+  Src := FHDMASource;
+  Dst := FHDMADest;
+  Bank := VRAMBank0or1;
+
+  for I := 0 to 15 do
+  begin
+    Off := (Dst - $8000) and $1FFF;
+    FVRAM[Off + Word(Bank) * $2000] := Read8(Src);
+    Inc(Src);
+    Inc(Dst);
+  end;
+
+  FHDMASource := Src;
+  FHDMADest := $8000 or ((Dst - $8000) and $1FF0);
+  Dec(FHDMABlocksRemaining);
+
+  FHDMA1 := Byte(FHDMASource shr 8);
+  FHDMA2 := Byte(FHDMASource and $F0);
+  FHDMA3 := Byte((FHDMADest - $8000) shr 8) and $1F;
+  FHDMA4 := Byte(FHDMADest and $F0);
+
+  if FHDMABlocksRemaining = 0 then
+  begin
+    FHDMAActive := False;
+    FHDMAHBlank := False;
+    FHDMA5 := $FF;
+  end
+  else if FHDMAActive and FHDMAHBlank then
+    FHDMA5 := (FHDMABlocksRemaining - 1) and $7F
+  else
+    FHDMA5 := $80 or ((FHDMABlocksRemaining - 1) and $7F);
+end;
+
+procedure TGBMMU.MaybeStepHBlankHDMA(OldMode, NewMode: Byte; OldLY: Byte; Cycles: Cardinal);
+begin
+  if not (FCGBMode and FHDMAActive and FHDMAHBlank) then
+    Exit;
+
+  { 精细路径: 可见线进入 mode0(HBlank) 时传输一个 16-byte block。 }
+  if (OldMode <> 0) and (NewMode = 0) and Assigned(FPPU) and (FPPU.LY < 144) then
+  begin
+    ExecuteHDMABlock;
+    Exit;
+  end;
+
+  { 粗粒度兜底: 一次推进 >= 456 cycles 可能跨过模式边沿，补执行一次。 }
+  if (Cycles >= 456) and (OldLY < 144) then
+    ExecuteHDMABlock;
+end;
+
 function TGBMMU.Read8ForDisplay(Addr: Word): Byte;
 var
   Off: Word;
 begin
+  { 给 PPU 渲染线程/路径读取“帧起始快照”的 VRAM。 }
   Addr := Addr and $FFFF;
   if (Addr >= $8000) and (Addr <= $9FFF) then
   begin
@@ -398,6 +528,7 @@ function TGBMMU.ReadVRAMBankedForDisplay(Addr: Word; Bank: Byte): Byte;
 var
   Off: Word;
 begin
+  { CGB 显示路径按 bank 读取快照。 }
   Addr := Addr and $FFFF;
   if (Addr >= $8000) and (Addr <= $9FFF) then
   begin
@@ -409,14 +540,24 @@ begin
 end;
 
 procedure TGBMMU.Update(Cycles: Cardinal);
+var
+  OldMode, NewMode: Byte;
+  OldLY: Byte;
 begin
+  { 供“非 CPU tick 驱动”路径使用：统一推进 serial/APU/timer/PPU。 }
   UpdateSerial(Cycles);
   if Assigned(FAPU) then
     FAPU.Update(Cycles);
   if Assigned(FTimer) then
     FTimer.Update(Cycles);
   if Assigned(FPPU) then
+  begin
+    OldMode := FPPU.Mode;
+    OldLY := FPPU.LY;
     FPPU.Update(Cycles);
+    NewMode := FPPU.Mode;
+    MaybeStepHBlankHDMA(OldMode, NewMode, OldLY, Cycles);
+  end;
   if FDMAActive then
   begin
     FDMACycles := FDMACycles + Cycles;
@@ -429,6 +570,8 @@ procedure TGBMMU.RunCpuAndTimer(Cycles: Cardinal);
 var
   Total: Cardinal;
 begin
+  { 扫描线调度模式下，按预算 cycles 运行 CPU；
+    若 CPU.OnTick=nil，则由本函数兜底推进 timer。 }
   Total := 0;
   while (Total < Cycles) and Assigned(FCpu) do
   begin
@@ -445,6 +588,9 @@ function TGBMMU.Read8ForPPU(Addr: Word): Byte;
 var
   Off: Word;
 begin
+  { PPU 取数入口:
+    - VRAM/OAM 走本地数组，避免再次触发 CPU 侧副作用
+    - 其他地址回退 MMU.Read8。 }
   Addr := Addr and $FFFF;
   if (Addr >= $8000) and (Addr <= $9FFF) then
   begin
@@ -461,6 +607,7 @@ function TGBMMU.ReadVRAMBankedForPPU(Addr: Word; Bank: Byte): Byte;
 var
   Off: Word;
 begin
+  { CGB 渲染读取指定 VRAM bank（tile attr 的 bank 位会走这里）。 }
   Addr := Addr and $FFFF;
   if (Addr >= $8000) and (Addr <= $9FFF) then
   begin
@@ -476,6 +623,8 @@ var
   Base: Integer;
   Lo, Hi: Byte;
 begin
+  { CGB 调色板 RAM:
+    8 palettes * 4 colors * 2 bytes(15-bit BGR), 共 64 字节每组。 }
   Base := ((PaletteIndex and 7) * 8) + ((ColorIndex and 3) * 2);
   if IsOBJ then
   begin
@@ -496,25 +645,32 @@ var
   Off: Word;
   WBank: Byte;
 begin
+  { Pan Docs memory map:
+    0000-7FFF ROM, 8000-9FFF VRAM, A000-BFFF cart RAM,
+    C000-DFFF WRAM, E000-FDFF echo, FE00-FE9F OAM, FF00-FF7F I/O, FF80-FFFE HRAM. }
   Addr := Addr and $FFFF;
   case Addr shr 8 of
     $00..$3F, $40..$7F:
+      { ROM read（含 MBC bank 选择） }
       if Assigned(FCart) then
         Result := FCart.ReadROM(Addr)
       else
         Result := $FF;
     $80..$9F:
       begin
+        { VRAM read: DMG 固定 bank0，CGB 由 VBK 选择。 }
         Off := Addr - $8000;
         Result := FVRAM[Off + Word(VRAMBank0or1) * $2000];
       end;
     $A0..$BF:
+      { External RAM read（需由卡带控制器判定 enable/bank）。 }
       if Assigned(FCart) then
         Result := FCart.ReadRAM(Addr)
       else
         Result := $FF;
     $C0..$DF:
       begin
+        { WRAM: C000-CFFF 固定 bank0，D000-DFFF 在 CGB 下可切换 1..7。 }
         if Addr < $D000 then
           Result := FWRAM[Addr - $C000] { bank 0 }
         else
@@ -525,6 +681,7 @@ begin
       end;
     $E0..$FD:
       begin
+        { Echo RAM: E000-FDFF 镜像 C000-DDFF。 }
         A := Addr - $2000;
         if A < $D000 then
           Result := FWRAM[A - $C000]
@@ -537,12 +694,14 @@ begin
     $FE:
       if Addr < $FEA0 then
       begin
+        { OAM 在 mode2/mode3 不可由 CPU 读取（返回 $FF）。 }
         if Assigned(FPPU) and ((FPPU.LCDC and $80) <> 0) and (FPPU.Mode in [2, 3]) then
           Result := $FF
         else
           Result := FOAM[Addr - $FE00];
       end
       else
+        { FEA0-FEFF 为不可用区（Not Usable）。 }
         Result := $FF;
     $FF:
       case Addr of
@@ -565,6 +724,31 @@ begin
         $FF4D:
           if FCGBMode then
             Result := (FKEY1 and $81) or $7E
+          else
+            Result := $FF;
+        $FF51:
+          if FCGBMode then
+            Result := FHDMA1
+          else
+            Result := $FF;
+        $FF52:
+          if FCGBMode then
+            Result := FHDMA2
+          else
+            Result := $FF;
+        $FF53:
+          if FCGBMode then
+            Result := FHDMA3 or $E0
+          else
+            Result := $FF;
+        $FF54:
+          if FCGBMode then
+            Result := FHDMA4
+          else
+            Result := $FF;
+        $FF55:
+          if FCGBMode then
+            Result := FHDMA5
           else
             Result := $FF;
         $FF68:
@@ -613,13 +797,16 @@ var
   WBank: Byte;
   Idx: Byte;
 begin
+  { Write 路径保持与 Read 路径对称，并在 I/O 地址应用副作用。 }
   Addr := Addr and $FFFF;
   case Addr shr 8 of
     $00..$3F, $40..$7F:
+      { 写 ROM 地址实际上是在写 MBC 控制寄存器。 }
       if Assigned(FCart) then
         FCart.WriteROM(Addr, Value);
     $80..$9F:
       begin
+        { VRAM 写入；用于调试统计 VRAM 活跃度。 }
         Off := Addr - $8000;
         FVRAM[Off + Word(VRAMBank0or1) * $2000] := Value;
         Inc(FVRAMWriteCount);
@@ -641,6 +828,7 @@ begin
       end;
     $E0..$FD:
       begin
+        { Echo RAM 镜像写。 }
         A := Addr - $2000;
         if A < $D000 then
           FWRAM[A - $C000] := Value
@@ -653,6 +841,7 @@ begin
     $FE:
       if Addr < $FEA0 then
       begin
+        { OAM 在 DMA 活跃或 PPU mode2/3 时屏蔽 CPU 写。 }
         if (not FDMAActive) and not (Assigned(FPPU) and ((FPPU.LCDC and $80) <> 0) and (FPPU.Mode in [2, 3])) then
           FOAM[Addr - $FE00] := Value;
       end;
@@ -663,6 +852,7 @@ begin
         $FF01: FSerial[0] := Value;
         $FF02: begin
                  FSerial[1] := Value;
+                 { SC bit7=start 且 bit0=internal clock 时启动传输。 }
                  if ((Value and $81) = $81) then
                  begin
                    FSerialActive := True;
@@ -682,8 +872,55 @@ begin
         $FF4D:
           if FCGBMode then
           begin
+            { KEY1: 仅 bit0 可写（prepare speed switch），bit7 只读当前速度。 }
             FKEY1 := (FKEY1 and $80) or (Value and 1);
             Inc(FKey1Writes);
+          end;
+        $FF51:
+          if FCGBMode then
+            FHDMA1 := Value;
+        $FF52:
+          if FCGBMode then
+            FHDMA2 := Value and $F0;
+        $FF53:
+          if FCGBMode then
+            FHDMA3 := Value and $1F;
+        $FF54:
+          if FCGBMode then
+            FHDMA4 := Value and $F0;
+        $FF55:
+          if FCGBMode then
+          begin
+            { HDMA5:
+              - bit7=1: HBlank DMA（分块）
+              - bit7=0: General DMA（立即全部传完）
+              - HBlank 活跃时写 bit7=0 可中止。 }
+            if FHDMAActive and FHDMAHBlank and ((Value and $80) = 0) then
+            begin
+              FHDMAActive := False;
+              FHDMAHBlank := False;
+              FHDMA5 := $80 or ((FHDMABlocksRemaining - 1) and $7F);
+            end
+            else
+            begin
+              FHDMASource := (Word(FHDMA1) shl 8) or (Word(FHDMA2) and $F0);
+              FHDMADest := $8000 or ((Word(FHDMA3 and $1F) shl 8) or (Word(FHDMA4) and $F0));
+              FHDMABlocksRemaining := (Value and $7F) + 1;
+              if (Value and $80) <> 0 then
+              begin
+                FHDMAActive := True;
+                FHDMAHBlank := True;
+                FHDMA5 := (FHDMABlocksRemaining - 1) and $7F; { bit7=0 while active }
+              end
+              else
+              begin
+                FHDMAActive := False;
+                FHDMAHBlank := False;
+                while FHDMABlocksRemaining > 0 do
+                  ExecuteHDMABlock;
+                FHDMA5 := $FF;
+              end;
+            end;
           end;
         $FF68:
           if FCGBMode then
@@ -691,6 +928,7 @@ begin
         $FF69:
           if FCGBMode then
           begin
+            { BG palette data: BGPI bit7=1 时写后自动递增索引。 }
             Idx := FBGPI and $3F;
             FBGPaletteRAM[Idx] := Value;
             if (FBGPI and $80) <> 0 then
@@ -702,6 +940,7 @@ begin
         $FF6B:
           if FCGBMode then
           begin
+            { OBJ palette data: OBPI bit7=1 时写后自动递增索引。 }
             Idx := FOBPI and $3F;
             FOBPaletteRAM[Idx] := Value;
             if (FOBPI and $80) <> 0 then
@@ -712,6 +951,8 @@ begin
             FSVBK := Value and 7;
         $FF46:
           begin
+            { OAM DMA: 从 XX00-XX9F 复制 160 字节到 FE00-FE9F。
+              这里一次性拷贝数据，另用 FDMACycles 维持“DMA 活跃窗口”时序屏蔽。 }
             FDMA := Value;
             FDMAActive := True;
             FDMACycles := 0;
@@ -734,7 +975,12 @@ procedure TGBMMU.CpuTick(Cycles: Cardinal);
 var
   EffectivePPU: Cardinal;
   TimerCycles: Cardinal;
+  OldMode, NewMode: Byte;
+  OldLY: Byte;
 begin
+  { CPU 每条指令结束后回调:
+    - timer/APU/serial 跟随 CPU 速度（双速时更快）
+    - PPU 固定“正常速率”，双速时相当于每 2 CPU cycles 才走 1 PPU cycle。 }
   if FDoubleSpeed then
   begin
     { In CGB double-speed mode, CPU/timer run faster, while PPU timing stays at normal speed. }
@@ -756,7 +1002,13 @@ begin
   if TimerCycles > 0 then
     UpdateSerial(TimerCycles);
   if (EffectivePPU > 0) and Assigned(FPPU) then
+  begin
+    OldMode := FPPU.Mode;
+    OldLY := FPPU.LY;
     FPPU.Update(EffectivePPU);
+    NewMode := FPPU.Mode;
+    MaybeStepHBlankHDMA(OldMode, NewMode, OldLY, EffectivePPU);
+  end;
   if FDMAActive then
   begin
     FDMACycles := FDMACycles + EffectivePPU;
@@ -767,6 +1019,7 @@ end;
 
 procedure TGBMMU.CpuTickTimerOnly(Cycles: Cardinal);
 begin
+  { 扫描线调度下，CPU 与 PPU 在更高层分开推进，这里只推 timer/APU/serial。 }
   UpdateSerial(Cycles);
   if Assigned(FAPU) then
     FAPU.Update(Cycles);
@@ -782,6 +1035,8 @@ end;
 
 function TGBMMU.HandleStop: Boolean;
 begin
+  { CGB STOP + KEY1.bit0=1 触发速度切换。
+    这里返回 True 告诉 CPU: STOP 已被“速度切换”消费，不进入普通停机。 }
   Result := False;
   if FCGBMode and ((FKEY1 and $01) <> 0) then
   begin
@@ -800,6 +1055,13 @@ procedure TGBMMU.OnCpuBusAccess(Addr: Word; IsWrite: Boolean);
 var
   Ticks: UInt64;
 begin
+  { CPU 普通总线访问回调（来自 TCpu 的 OnBusAccess）。 }
+  if FCGBMode then
+  begin
+    FPendingBusOAMValid := False;
+    Exit;
+  end;
+
   if Assigned(FCpu) then
     Ticks := FCpu.TotalTicks
   else
@@ -824,6 +1086,13 @@ var
   IDUInOAM: Boolean;
   Combined: Boolean;
 begin
+  { CPU 内部 IDU 地址更新操作回调（来自 TCpu 的 OnIDUOp）。 }
+  if FCGBMode then
+  begin
+    FPendingBusOAMValid := False;
+    Exit;
+  end;
+
   if Assigned(FCpu) then
     Ticks := FCpu.TotalTicks
   else
@@ -853,11 +1122,13 @@ end;
 
 function TGBMMU.Read16(Addr: Word): Word;
 begin
+  { 小端序 16-bit 读。 }
   Result := Read8(Addr) or (Word(Read8((Addr + 1) and $FFFF)) shl 8);
 end;
 
 procedure TGBMMU.Write16(Addr: Word; Value: Word);
 begin
+  { 小端序 16-bit 写，低字节在前。 }
   Addr := Addr and $FFFF;
   Write8(Addr, Byte(Value and $FF));
   Write8((Addr + 1) and $FFFF, Byte(Value shr 8));

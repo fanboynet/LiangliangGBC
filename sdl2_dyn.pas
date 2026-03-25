@@ -1,6 +1,16 @@
-unit sdl2_dyn;
+﻿unit sdl2_dyn;
+{ 单元定义: SDL 动态绑定适配层。 }
+{ 负责内容: 按平台加载 SDL 动态库、导出函数指针绑定与错误文本回退。 }
+
+
 
 interface
+
+{
+  作用:
+  - 将 SDL2 运行时依赖改为“动态加载 + 函数指针绑定”。
+  - 避免编译期强依赖 import library，便于跨平台与分发。
+}
 
 uses
 {$IFDEF MSWINDOWS}
@@ -166,6 +176,10 @@ var
 {$ENDIF}
 {$ENDIF}
 begin
+  { 平台分支:
+    - Windows: LoadLibrary
+    - FPC Unix: Dynlibs.LoadLibrary
+    - Delphi Unix: dlopen }
 {$IFDEF MSWINDOWS}
   Result := Pointer(LoadLibrary(PChar(AName)));
 {$ELSE}
@@ -210,6 +224,7 @@ end;
 
 function TryLoadOne(const ALibName: string): Boolean;
 begin
+  { 尝试加载一个候选库，并绑定本单元需要的最小函数集。 }
   Result := False;
   GSDLHandle := OpenDynLib(ALibName);
   if GSDLHandle = nil then
@@ -258,6 +273,7 @@ var
   Candidates: array[0..7] of string;
   Count, I: Integer;
 begin
+  { 若未指定库名，则按平台候选列表逐个尝试。 }
   Result := False;
   if GSDLHandle <> nil then
     Exit(True);
@@ -289,6 +305,7 @@ end;
 
 procedure SDL_Unload;
 begin
+  { 先清空函数指针，再关闭动态库句柄。 }
   @SDL_Init := nil;
   @SDL_Quit := nil;
   @SDL_CreateWindow := nil;
@@ -323,6 +340,7 @@ function SDL_ErrorText: string;
 var
   P: PAnsiChar;
 begin
+  { SDL_GetError 不可用时回退固定文本，避免再触发空指针。 }
   if Assigned(SDL_GetError) then
   begin
     P := SDL_GetError;

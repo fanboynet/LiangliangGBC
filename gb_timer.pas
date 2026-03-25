@@ -1,6 +1,17 @@
-unit gb_timer;
+﻿unit gb_timer;
+{ 单元定义: 定时器子系统（DIV/TIMA/TMA/TAC）。 }
+{ 负责内容: 分频计数、边沿触发、溢出重装与定时器中断请求。 }
 
-{ Game Boy timer: DIV, TIMA, TMA, TAC. Update(cycles). Requests IRQ on overflow. }
+
+
+{
+  Game Boy timer: DIV/TIMA/TMA/TAC.
+  核心模型:
+  - 以内部 16-bit 分频计数器 FDivCounter 的某一位作为“输入信号”。
+  - TIMA 在该信号出现 1->0 的下降沿时递增（falling-edge model）。
+  - TIMA 溢出后延迟 4 T-cycles 才装载 TMA 并请求 Timer IRQ(bit2)。
+  参考: Pan Docs / Timer and Divider Registers.
+}
 
 interface
 
@@ -37,6 +48,7 @@ implementation
 
 function TGBTimer.GetDIV: Byte;
 begin
+  { FF04 只暴露内部 16-bit 计数器的高 8 位。 }
   Result := Byte(FDivCounter shr 8);
 end;
 
@@ -52,6 +64,7 @@ end;
 
 function TGBTimer.GetTimerBitMask: Word;
 begin
+  { TAC bits1..0 选择输入分频位（对应不同频率）。 }
   case (FTAC and 3) of
     0: Result := Word(1 shl 9); { 4096 Hz }
     1: Result := Word(1 shl 3); { 262144 Hz }
@@ -63,12 +76,13 @@ end;
 
 function TGBTimer.TimerSignal: Boolean;
 begin
+  { 计时器输入信号 = (TAC 使能) AND (被选中的 DIV 位为 1)。 }
   Result := ((FTAC and 4) <> 0) and ((FDivCounter and GetTimerBitMask) <> 0);
 end;
 
 procedure TGBTimer.IncrementTIMA;
 begin
-  { While overflow reload is pending, additional falling edges are ignored. }
+  { 溢出重装窗口内忽略新的边沿，避免重复计数。 }
   if FReloadDelay >= 0 then
     Exit;
   if FTIMA = $FF then
@@ -84,6 +98,7 @@ procedure TGBTimer.TickOneCycle;
 var
   OldSignal, NewSignal: Boolean;
 begin
+  { 逐 T-cycle 推进，保证时序测试可观察到中间态。 }
   if FReloadDelay > 0 then
   begin
     Dec(FReloadDelay);
@@ -105,6 +120,7 @@ end;
 
 procedure TGBTimer.Update(Cycles: Cardinal);
 begin
+  { 不做批量公式，逐周期推进以保持边沿/重装语义正确。 }
   while Cycles > 0 do
   begin
     TickOneCycle;
@@ -134,6 +150,7 @@ begin
   case Addr of
     $FF04:
       begin
+        { 写 DIV 会将内部 16-bit 计数器清零，可能制造一次下降沿并触发 TIMA+1。 }
         OldSignal := TimerSignal;
         FDivCounter := 0;
         NewSignal := TimerSignal;
@@ -142,12 +159,15 @@ begin
       end;
     $FF05:
       begin
+        { 写 TIMA:
+          本实现采用“取消 pending reload”模型，和常见测试 ROM 行为一致。 }
         FTIMA := Value;
         FReloadDelay := -1; { Writing TIMA cancels pending reload in this model }
       end;
     $FF06: FTMA := Value;
     $FF07:
       begin
+        { 改 TAC 可能改变输入信号电平，从而产生下降沿副作用。 }
         OldSignal := TimerSignal;
         OldEnable := (FTAC and 4) <> 0;
         FTAC := Value and 7;

@@ -1,4 +1,14 @@
-program GBEmuSDL;
+﻿program GBEmuSDL;
+{ 单元定义: SDL 图形前端入口程序。 }
+{ 负责内容: SDL 初始化、事件循环、音频队列、帧渲染、速度统计与命令行参数处理。 }
+
+{ 该程序是 SDL 前端，负责跨平台窗口、键盘、音频队列与帧显示。 }
+{
+  说明:
+  - 模拟核心逻辑在 gb_core/gb_mmu/gb_cpu/gb_ppu/gb_apu。
+  - 本文件只做“宿主层”集成（事件、渲染、音频设备、节流/FPS 统计）。
+}
+
 
 {$APPTYPE CONSOLE}
 
@@ -14,7 +24,7 @@ uses
 const
   GB_WIDTH = 160;
   GB_HEIGHT = 144;
-  SCALE = 2;
+  DEFAULT_SCALE = 1;
 
 type
   TSDLApp = class
@@ -37,6 +47,8 @@ type
     FStatRenderFrames: Cardinal;
     FPixels: array[0..GB_WIDTH * GB_HEIGHT - 1] of Cardinal;
     FDestRect: TSDL_Rect;
+    FLinearFilter: Boolean;
+    FScale: Integer;
     procedure OnSerialByte(AByte: Byte);
     procedure OnAudioSample(ALeft, ARight: SmallInt);
     procedure SetKey(AKey: Integer; APressed: Boolean);
@@ -48,13 +60,14 @@ type
   public
     constructor Create;
     destructor Destroy; override;
-    function Init(const ARomPath: string): Boolean;
+    function Init(const ARomPath: string; ALinearFilter: Boolean; AScale: Integer): Boolean;
     procedure Run;
   end;
 
 constructor TSDLApp.Create;
 begin
   inherited Create;
+  { 初始化前端状态与默认 Joypad 全松开。 }
   FCore := TGBCore.Create;
   FCore.OnSerialByte := OnSerialByte;
   FCore.ScheduleMode := smNormal;
@@ -73,10 +86,12 @@ begin
   FStatLastTicks := 0;
   FStatEmuFrames := 0;
   FStatRenderFrames := 0;
+  FLinearFilter := True;
+  FScale := DEFAULT_SCALE;
   FDestRect.X := 0;
   FDestRect.Y := 0;
-  FDestRect.W := GB_WIDTH * SCALE;
-  FDestRect.H := GB_HEIGHT * SCALE;
+  FDestRect.W := GB_WIDTH * FScale;
+  FDestRect.H := GB_HEIGHT * FScale;
 end;
 
 destructor TSDLApp.Destroy;
@@ -92,6 +107,7 @@ begin
   if Assigned(SDL_Quit) then
     SDL_Quit;
   SDL_Unload;
+  FCore.SaveBatteryRAM;
   FCore.Free;
   inherited;
 end;
@@ -110,6 +126,7 @@ end;
 
 procedure TSDLApp.OnAudioSample(ALeft, ARight: SmallInt);
 begin
+  { APU 回调线程上下文简单化: 先写入线性缓冲，主循环统一 Queue 到 SDL。 }
   if FAudioCount + 2 > Length(FAudioBuffer) then
     Exit;
   FAudioBuffer[FAudioCount] := ALeft;
@@ -125,6 +142,7 @@ var
   Queued: Cardinal;
   Bytes: Cardinal;
 begin
+  { 限制队列深度，避免音频累计导致明显延迟。 }
   if (FAudioDevice = 0) or (FAudioCount <= 0) then
     Exit;
   Queued := SDL_GetQueuedAudioSize(FAudioDevice);
@@ -152,6 +170,7 @@ procedure TSDLApp.SetKey(AKey: Integer; APressed: Boolean);
       B := B or Mask;
   end;
 begin
+  { 键位映射与 VCL 保持一致。 }
   case AKey of
     SDLK_w: SetBit(FDirections, $04); { Up }
     SDLK_a: SetBit(FDirections, $02); { Left }
@@ -206,6 +225,7 @@ var
   CgbPal: Byte;
   IsObj: Boolean;
 begin
+  { 将核心帧缓冲转换成 ARGB8888 纹理像素。 }
   BGP := FCore.Mmu.BGP;
   OBP0 := FCore.Mmu.OBP0;
   OBP1 := FCore.Mmu.OBP1;
@@ -229,6 +249,7 @@ begin
       Obj := FCore.Mmu.PPU.FObjBuffer[Y, X];
       if FCore.Mmu.IsCGBMode then
       begin
+        { CGB: 读取 15-bit BGR palette 并扩展到 8-bit RGB。 }
         IsObj := Obj <> 0;
         if IsObj then
           CgbPal := FCore.Mmu.PPU.FObjPalBuffer[Y, X] and 7
@@ -275,6 +296,7 @@ end;
 
 procedure TSDLApp.Present;
 begin
+  { 一次完整提交: build -> upload texture -> render copy -> present。 }
   BuildFrame;
   SDL_UpdateTexture(FTexture, nil, @FPixels[0], GB_WIDTH * SizeOf(Cardinal));
   SDL_RenderClear(FRenderer);
@@ -291,6 +313,7 @@ var
   EmuFps, RenderFps, SpeedPct: Double;
   Title: AnsiString;
 begin
+  { 每秒更新窗口标题，显示模拟 FPS / 渲染 FPS / 相对 59.7275Hz 速度百分比。 }
   if FStatLastTicks = 0 then
   begin
     FStatLastTicks := ANowTicks;
@@ -319,10 +342,11 @@ begin
   FStatRenderFrames := 0;
 end;
 
-function TSDLApp.Init(const ARomPath: string): Boolean;
+function TSDLApp.Init(const ARomPath: string; ALinearFilter: Boolean; AScale: Integer): Boolean;
 var
   Desired: TSDL_AudioSpec;
 begin
+  { 宿主初始化顺序: SDL 动态加载 -> video/audio -> window/renderer/texture -> core rom -> audio route。 }
   Result := False;
   if not SDL_Load then
   begin
@@ -336,11 +360,24 @@ begin
     Exit;
   end;
 
+  FLinearFilter := ALinearFilter;
+  if AScale < 1 then
+    FScale := 1
+  else
+    FScale := AScale;
+  FDestRect.W := GB_WIDTH * FScale;
+  FDestRect.H := GB_HEIGHT * FScale;
   if Assigned(SDL_SetHint) then
-    SDL_SetHint('SDL_RENDER_SCALE_QUALITY', '0');
+  begin
+    { 纹理缩放模式: linear/nearest。 }
+    if FLinearFilter then
+      SDL_SetHint('SDL_RENDER_SCALE_QUALITY', '1')  { linear }
+    else
+      SDL_SetHint('SDL_RENDER_SCALE_QUALITY', '0'); { nearest }
+  end;
 
   FWindow := SDL_CreateWindow('GBEmu SDL', SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-    GB_WIDTH * SCALE, GB_HEIGHT * SCALE, SDL_WINDOW_SHOWN);
+    GB_WIDTH * FScale, GB_HEIGHT * FScale, SDL_WINDOW_SHOWN);
   if FWindow = nil then
   begin
     WriteLn('SDL_CreateWindow failed: ', SDL_ErrorText);
@@ -395,6 +432,11 @@ var
   NowTicks, DeltaTicks: Cardinal;
   WaitMs: Integer;
 begin
+  { 主循环:
+    - 事件泵
+    - 固定帧长累积（59.7275Hz）驱动核心
+    - 音频刷新与图像呈现
+    - 适度 Delay 防止跑超速。 }
   FRunning := True;
   while FRunning do
   begin
@@ -432,14 +474,58 @@ end;
 var
   App: TSDLApp;
   RomPath: string;
+  I: Integer;
+  P: string;
+  S: string;
+  LinearFilter: Boolean;
+  Scale: Integer;
 begin
   if ParamCount < 1 then
   begin
-    WriteLn('Usage: GBEmuSDL <rom.gb>');
+    WriteLn('Usage: GBEmuSDL <rom.gb|rom.gbc> [--linear|--nearest] [--scale N|--scale=N]');
     Halt(1);
   end;
 
-  RomPath := ParamStr(1);
+  RomPath := '';
+  LinearFilter := True;
+  Scale := DEFAULT_SCALE;
+  I := 1;
+  while I <= ParamCount do
+  begin
+    P := ParamStr(I);
+    if SameText(P, '--nearest') then
+      LinearFilter := False
+    else if SameText(P, '--linear') then
+      LinearFilter := True
+    else if SameText(P, '--scale') then
+    begin
+      if I < ParamCount then
+      begin
+        Inc(I);
+        Scale := StrToIntDef(ParamStr(I), DEFAULT_SCALE);
+      end;
+    end
+    else if Pos('--scale=', LowerCase(P)) = 1 then
+    begin
+      S := Copy(P, 9, MaxInt);
+      Scale := StrToIntDef(S, DEFAULT_SCALE);
+    end
+    else if (RomPath = '') then
+      RomPath := P;
+    Inc(I);
+  end;
+
+  if Scale < 1 then
+    Scale := 1;
+  if Scale > 12 then
+    Scale := 12;
+
+  if RomPath = '' then
+  begin
+    WriteLn('ROM path missing.');
+    Halt(1);
+  end;
+
   if not FileExists(RomPath) then
   begin
     WriteLn('ROM not found: ', RomPath);
@@ -448,7 +534,7 @@ begin
 
   App := TSDLApp.Create;
   try
-    if not App.Init(RomPath) then
+    if not App.Init(RomPath, LinearFilter, Scale) then
       Halt(2);
     App.Run;
   finally

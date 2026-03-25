@@ -1,15 +1,28 @@
-unit gb_ppu;
+﻿unit gb_ppu;
+{ 单元定义: 像素处理器（PPU）扫描线渲染与显示时序核心。 }
+{ 负责内容: LCD 模式切换、BG/Window/Sprite 合成、LY/STAT/LCDC 寄存器行为、VBlank/STAT 中断请求。 }
 
-{ Game Boy PPU: background, framebuffer, LY, VBlank. Update(cycles). }
+
+
+{
+  Game Boy PPU timing/render core.
+  本单元重点:
+  - 456 dots/line, 154 lines/frame 的模式机（mode2/3/0 + vblank mode1）。
+  - BG/Window/OBJ 合成与优先级规则（DMG 与 CGB 有差异）。
+  - STAT 线与中断边沿行为（LYC、mode 中断源）。
+  参考: Pan Docs / Rendering / LCD Status Registers / Pixel FIFO 概述。
+}
 
 interface
 
 const
   GB_WIDTH = 160;
   GB_HEIGHT = 144;
+  { 一个扫描线固定 456 dots（T-cycle 粒度）。 }
   DOTS_PER_SCANLINE = 456;
   CYCLES_PER_DOT = 1; { Use T-cycles directly; CPU Step cycle table is already in T-cycles. }
   CYCLES_PER_SCANLINE = DOTS_PER_SCANLINE * CYCLES_PER_DOT;
+  { 可见线 144 + VBlank 10 = 154。 }
   SCANLINES_PER_FRAME = 154;
   CYCLES_PER_FRAME = CYCLES_PER_SCANLINE * SCANLINES_PER_FRAME;
 
@@ -59,6 +72,7 @@ type
     procedure RenderSprites(LineY: Integer);
   public
     FFramebuffer: TFramebuffer;
+    FBGColorBuffer: TFramebuffer; { BG/WIN color index before OBJ composition }
     FObjBuffer: TFramebuffer;  { 0=BG/win, 1=OBP0, 2=OBP1 }
     FBGPalBuffer: TFramebuffer; { CGB: BG palette index 0..7 }
     FObjPalBuffer: TFramebuffer; { CGB: OBJ palette index 0..7 }
@@ -87,6 +101,7 @@ implementation
 
 function TGBPPU.ReadVRAM(Addr: Word): Byte;
 begin
+  { 渲染路径可选读取“显示快照 VRAM”，减少同帧写入造成的抖动差异。 }
   if FUseDisplayVRAM and Assigned(FOnRead8ForDisplay) then
     Result := FOnRead8ForDisplay(Addr)
   else if Assigned(FOnRead8) then
@@ -97,6 +112,7 @@ end;
 
 function TGBPPU.ReadVRAMBanked(Addr: Word; Bank: Byte): Byte;
 begin
+  { CGB 需要根据属性位读取 bank0/1。 }
   if FUseDisplayVRAM and Assigned(FOnReadVRAMBankedForDisplay) then
     Result := FOnReadVRAMBankedForDisplay(Addr, Bank)
   else if Assigned(FOnReadVRAMBanked) then
@@ -109,6 +125,7 @@ end;
 
 function TGBPPU.ReadOAM(Offset: Byte): Byte;
 begin
+  { OAM 读取统一走 MMU 回调，以共享访问限制策略。 }
   if Assigned(FOnRead8) then
     Result := FOnRead8($FE00 + Word(Offset))
   else
@@ -146,6 +163,7 @@ begin
     for X := 0 to GB_WIDTH - 1 do
     begin
       FFramebuffer[LineY, X] := 0;
+      FBGColorBuffer[LineY, X] := 0;
       FObjBuffer[LineY, X] := 0;
       FBGPalBuffer[LineY, X] := 0;
       FObjPalBuffer[LineY, X] := 0;
@@ -162,12 +180,7 @@ begin
     if Assigned(FOnBeforeTile) then
       FOnBeforeTile(LineY, Tc);
     if FLCDC and 8 <> 0 then
-    begin
-      if (ReadVRAM($9C00) = 0) and (ReadVRAM($9800) <> 0) then
-        MapBase := $9800
-      else
-        MapBase := $9C00;
-    end
+      MapBase := $9C00
     else
       MapBase := $9800;
     if FLCDC and 16 <> 0 then
@@ -199,6 +212,7 @@ begin
       end;
       if SignedTiles then
         TileIdx := ShortInt(Byte(TileIdx));
+      { LCDC bit4=0 时使用“有符号 tile 编号”寻址到 $8800 区。 }
       if SignedTiles then
         TileAddr := $8800 + Word((TileIdx + 128) and $FF) * 16
       else
@@ -214,6 +228,7 @@ begin
       else
         BitIdx := 7 - (TileCol and 7);
       ColorIdx := (((Hi shr BitIdx) and 1) shl 1) or ((Lo shr BitIdx) and 1);
+      FBGColorBuffer[LineY, X] := ColorIdx;
       FFramebuffer[LineY, X] := ColorIdx;
       FBGPalBuffer[LineY, X] := PalIdx;
       FBGPriorityBuffer[LineY, X] := (Attr shr 7) and 1;
@@ -253,6 +268,7 @@ begin
         end;
         if SignedTiles then
           TileIdx := ShortInt(Byte(TileIdx));
+        { Window 与 BG 共用 tile addressing 规则。 }
         if SignedTiles then
           TileAddr := $8800 + Word((TileIdx + 128) and $FF) * 16
         else
@@ -269,6 +285,7 @@ begin
           BitIdx := 7 - (WinX and 7);
         ColorIdx := (((Hi shr BitIdx) and 1) shl 1) or
                     ((Lo shr BitIdx) and 1);
+        FBGColorBuffer[LineY, X] := ColorIdx;
         FFramebuffer[LineY, X] := ColorIdx;
         FBGPalBuffer[LineY, X] := PalIdx;
         FBGPriorityBuffer[LineY, X] := (Attr shr 7) and 1;
@@ -307,6 +324,7 @@ var
   LocalX, BitIdx: Integer;
   BGOverObj: Boolean;
   BGMasterPriority: Boolean;
+  BgColor: Byte;
 begin
   BGMasterPriority := (FLCDC and $01) <> 0;
   if (FLCDC and $04) <> 0 then
@@ -381,19 +399,25 @@ begin
       else
         BitIdx := 7 - LocalX; { normal: screen left = tile left (bit 7) }
       ColorIdx := (((Hi shr BitIdx) and 1) shl 1) or ((Lo shr BitIdx) and 1);
+      { OBJ color 0 恒透明，不覆盖背景。 }
       if ColorIdx = 0 then
         Continue;
       if FCGBMode then
       begin
+        { CGB: 同时受 OBJ 优先位、BG 主开关与 BG attr 优先位影响。 }
+        BgColor := FBGColorBuffer[LineY, X] and 3;
         if BGMasterPriority then
           BGOverObj :=
-            (((Sprites[S].Flags and $80) <> 0) and ((FFramebuffer[LineY, X] and 3) <> 0)) or
-            ((FBGPriorityBuffer[LineY, X] <> 0) and ((FFramebuffer[LineY, X] and 3) <> 0))
+            (((Sprites[S].Flags and $80) <> 0) and (BgColor <> 0)) or
+            ((FBGPriorityBuffer[LineY, X] <> 0) and (BgColor <> 0))
         else
           BGOverObj := False;
       end
       else
-        BGOverObj := ((Sprites[S].Flags and $80) <> 0) and ((FFramebuffer[LineY, X] and 3) <> 0);
+      begin
+        BgColor := FBGColorBuffer[LineY, X] and 3;
+        BGOverObj := ((Sprites[S].Flags and $80) <> 0) and (BgColor <> 0);
+      end;
       if BGOverObj then
         Continue;
       FFramebuffer[LineY, X] := ColorIdx;
@@ -415,6 +439,7 @@ procedure TGBPPU.Reset;
 var
   Y, X: Integer;
 begin
+  { 采用“无 boot ROM”常见初值，保持测试 ROM 上电后可预测。 }
   FDotCounter := 0;
   FLY := 0;
   FMode := 2;
@@ -435,6 +460,7 @@ begin
     for X := 0 to GB_WIDTH - 1 do
     begin
       FFramebuffer[Y, X] := 0;
+      FBGColorBuffer[Y, X] := 0;
       FObjBuffer[Y, X] := 0;
       FBGPalBuffer[Y, X] := 0;
       FObjPalBuffer[Y, X] := 0;
@@ -457,6 +483,7 @@ end;
 
 procedure TGBPPU.SetMode(AMode: Byte; RequestEdge: Boolean);
 begin
+  { mode 仅 0..3，低两位写回 STAT[1:0]。 }
   if FMode <> (AMode and 3) then
   begin
     FMode := AMode and 3;
@@ -470,6 +497,7 @@ var
   Coincidence: Boolean;
   NewStatLine: Boolean;
 begin
+  { STAT 中断并非“电平持续触发”，而是 STAT 条件线的上升沿触发一次 IRQ。 }
   Coincidence := (FLY = FLYC);
   if Coincidence then
     FSTAT := FSTAT or $04
@@ -494,9 +522,11 @@ var
   LineStep, OldCycles, NewCycles: Cardinal;
   DelayStep: Cardinal;
 begin
+  { 按 T-cycle 推进 PPU 模式机。 }
   LcdOn := (FLCDC and $80) <> 0;
   if not LcdOn then
   begin
+    { LCD 关闭时 LY=0，模式视作 HBlank（mode0）。 }
     FDotCounter := 0;
     FLY := 0;
     SetMode(0, True);
@@ -526,12 +556,14 @@ begin
     begin
       if (OldCycles < (80 * CYCLES_PER_DOT)) and (NewCycles >= (80 * CYCLES_PER_DOT)) then
       begin
+        { mode2->mode3: 进入像素传输。 }
         FMode3Dots := CalcMode3Dots;
         SetMode(3, True);
       end;
       if (OldCycles < Cardinal((80 + FMode3Dots) * CYCLES_PER_DOT)) and
          (NewCycles >= Cardinal((80 + FMode3Dots) * CYCLES_PER_DOT)) then
       begin
+        { mode3->mode0: 扫描线像素完成，进入 HBlank 并提交本行。 }
         SetMode(0, True);
         RenderScanline(FLY);
       end;
@@ -547,6 +579,7 @@ begin
 
       if FLY = 144 then
       begin
+        { 进入 VBlank（mode1）并请求 VBlank IRQ(bit0)。 }
         SetMode(1, True);
         if not FVBlankRequested then
         begin
@@ -557,6 +590,7 @@ begin
       end
       else if FLY >= SCANLINES_PER_FRAME then
       begin
+        { 一帧结束，回到第 0 行并触发 OnFrameStart。 }
         FLY := 0;
         FWinLineCounter := 0;
         FVBlankRequested := False;
@@ -580,6 +614,7 @@ end;
 
 function TGBPPU.Read(Addr: Word): Byte;
 begin
+  { PPU I/O 寄存器读（FF40..FF4B）。 }
   Addr := Addr and $FFFF;
   case Addr of
     $FF40: Result := FLCDC;
@@ -597,10 +632,12 @@ end;
 
 procedure TGBPPU.Write(Addr: Word; Value: Byte);
 begin
+  { PPU I/O 寄存器写。重点处理 LCD 开关边沿。 }
   Addr := Addr and $FFFF;
   case Addr of
     $FF40:
       begin
+        { LCD off->on 与 on->off 都会重置部分内部时序计数。 }
         if ((Value and $80) <> 0) and ((FLCDC and $80) = 0) then
         begin
           FDotCounter := 4; { LCD-on alignment: start one M-cycle into line 0 }
@@ -640,6 +677,7 @@ end;
 
 function TGBPPU.InMode2: Boolean;
 begin
+  { mode2 判定给 MMU/OAM bug 模型使用。 }
   Result := ((FLCDC and $80) <> 0) and
             (FLY < 144) and
             (FDotCounter < (80 * CYCLES_PER_DOT));
@@ -647,6 +685,7 @@ end;
 
 function TGBPPU.CurrentOAMRow: Integer;
 begin
+  { mode2 每 4 dots 扫过 1 个 OAM row（共 20 个）。 }
   if InMode2 then
     Result := Integer((FDotCounter + (4 * CYCLES_PER_DOT)) div (4 * CYCLES_PER_DOT))
   else
