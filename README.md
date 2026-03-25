@@ -9,4 +9,12 @@ A GameBoy/GameBoy Color emulator written in Pascal(Delphi).
 - **J/K**: Button A/B
 
 **Compiler：**
-- **Windwows(Delphi)**: dcc32 -B -Q .\GBEmuSDL.dpr 
+- **Windows(Delphi)**: dcc32 -B -Q .\GBEmuSDL.dpr
+
+**Run:**
+- **Windows**: .\GBEmuSDL.exe '.\Super Mario Bros. Deluxe (Japan) (NP).gbc' --scale=3
+- **Set Window Size(Default=1)**: --scale=4
+- **Set Screen Linear filtering(>2x window,Default --linear)**: --linear / --nearest
+
+
+
